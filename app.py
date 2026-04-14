@@ -1,5 +1,5 @@
 import streamlit as st
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 import os
 
 # 1. Configuración de la página
@@ -8,11 +8,11 @@ st.title("🚜 Asistente de Terreno IA")
 st.caption("Consulta las bitácoras y reportes de terreno guardados en Google Drive.")
 
 # 2. Obtener la clave de Gemini desde los secretos (lo configuraremos en el Paso 4)
-api_key = st.secrets.get("GEMINI_API_KEY", "CLAVE_NO_ENCONTRADA")
+api_key = st.secrets.get("GROQ_API_KEY", "CLAVE_NO_ENCONTRADA")
 
 # 3. Inicializar el motor de IA
 try:
-    llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=api_key)
+    llm = ChatGroq(model="llama3-8b-8192", groq_api_key=api_key)
 except Exception as e:
     st.error("Error al conectar con la IA. Revisa tu API Key.")
 
