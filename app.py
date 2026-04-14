@@ -12,7 +12,7 @@ api_key = st.secrets.get("GEMINI_API_KEY", "CLAVE_NO_ENCONTRADA")
 
 # 3. Inicializar el motor de IA
 try:
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key)
+    llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=api_key)
 except Exception as e:
     st.error("Error al conectar con la IA. Revisa tu API Key.")
 
