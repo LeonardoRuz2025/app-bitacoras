@@ -12,8 +12,8 @@ from langchain_core.messages import HumanMessage
 from pypdf import PdfReader
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Analista Masivo (Gemini)", layout="wide")
-st.title("🚀 Analista de Terreno Masivo (Motor Gemini)")
+st.set_page_config(page_title="Analista Masivo", layout="wide")
+st.title("🚀 Analista de Terreno Masivo (Bitacoras)")
 
 def get_drive_service():
     creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
