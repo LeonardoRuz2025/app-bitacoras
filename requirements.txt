@@ -3,7 +3,7 @@ google-api-python-client
 google-auth
 langchain
 langchain-groq
-chromadb
 pypdf
 pandas
 openpyxl
+pillow
