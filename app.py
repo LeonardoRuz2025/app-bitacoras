@@ -127,7 +127,7 @@ if user_input:
             
         # 3. ENVÍO A GEMINI CON PROMPT DE AUDITORÍA
         with st.spinner("Generando reporte técnico detallado..."):
-            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
             
             prompt_maestro = f"""
             Actúa como un Auditor Técnico de Terreno. Tu objetivo es reconstruir los hechos ocurridos según la consulta.
