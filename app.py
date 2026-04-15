@@ -39,24 +39,38 @@ def leer_archivo(service, file_id, mime_type):
 
 # --- BÚSQUEDA TIPO "GEMINI" (FULL TEXT) ---
 def buscar_inteligente(service, query_text):
-    # Paso 1: Buscar por CONTENIDO de texto, no solo nombre
-    # Limpiamos la query para buscar términos clave
-    terminos = re.findall(r'\w+', query_text)
-    contexto = ""
+    # 1. Extraer palabras manteniendo los guiones (ej. PBPC-06)
+    palabras_crudas = re.findall(r'[\w-]+', query_text)
     
-    # Buscamos archivos que contengan las palabras clave en su interior
-    for t in terminos:
-        if len(t) < 3: continue
-        # Esta es la clave: buscamos en el contenido completo
+    # 2. Filtrar palabras cortas o de relleno ('del', 'los', 'que', etc.)
+    palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['tenemos', 'registros', 'sobre', 'dame', 'informacion']]
+    
+    # Si todo se filtró, nos quedamos con la palabra más larga
+    if not palabras_clave:
+        palabras_clave = [max(palabras_crudas, key=len)]
+        
+    contexto = ""
+    archivos_leidos = 0
+    
+    for t in palabras_clave:
         q = f"fullText contains '{t}' and trashed = false"
         results = service.files().list(q=q, fields="files(id, name, mimeType)").execute()
         
-        for f in results.get('files', [])[:5]: # Tomamos los 5 más relevantes por término
+        # Solo tomamos los 3 primeros archivos más relevantes
+        for f in results.get('files', [])[:3]: 
+            if archivos_leidos >= 4: break # Tope máximo de 4 documentos en total
+            
             st.write(f"🔍 Analizando: {f['name']}...")
             contenido = leer_archivo(service, f['id'], f['mimeType'])
             if contenido:
                 contexto += f"\n--- ORIGEN: {f['name']} ---\n{contenido}\n"
-    
+                archivos_leidos += 1
+                
+    # 3. CORTAFUEGOS DE TOKENS PARA GROQ
+    # 12,000 tokens son aprox. 48,000 caracteres. Cortamos en 35,000 por seguridad.
+    if len(contexto) > 35000:
+        contexto = contexto[:35000] + "\n\n...[TEXTO RECORTADO POR LÍMITE DE MEMORIA DE LA IA]..."
+        
     return contexto
 
 # --- CHAT ---
