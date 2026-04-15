@@ -107,9 +107,9 @@ if pregunta:
                     if res["tipo"] == "texto": contexto_texto += res["contenido"] + "\n"
                     if res["tipo"] == "imagen": imagenes_base64.append(res["contenido"])
 
-            # PREPARAR EL MENSAJE PARA GROQ VISION
             # Inicializamos el modelo de Groq que soporta imágenes
-            llm = ChatGroq(model="llama-3.2-11b-vision-preview", groq_api_key=GROQ_API_KEY)
+            # PREPARAR EL MENSAJE PARA GROQ VISION
+            llm = ChatGroq(model="llama-3.2-90b-vision-preview", groq_api_key=GROQ_API_KEY)
             
             instruccion = f"""Eres un analista de bitácoras de terreno. 
             Responde la pregunta basándote estrictamente en este texto y en las fotos adjuntas.
