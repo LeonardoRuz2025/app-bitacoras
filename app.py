@@ -1,6 +1,7 @@
 import json
 import streamlit as st
 import re
+import time
 import pandas as pd
 import base64
 from io import BytesIO
@@ -17,14 +18,10 @@ st.set_page_config(page_title="Reporte Técnico de Terreno", layout="wide")
 st.title("📋 Gestión de Bitácoras Técnicas")
 
 def get_drive_service():
-    # Leemos el JSON completo desde un solo secreto
     info_claves = json.loads(st.secrets["GOOGLE_JSON_COMPLETO"])
-    
-    # Creamos las credenciales
     creds = service_account.Credentials.from_service_account_info(info_claves)
     return build('drive', 'v3', credentials=creds)
     
-# --- FUNCIÓN LECTORA ---
 def leer_archivo_multimodal(service, file_id, mime_type, file_name):
     try:
         request = service.files().get_media(fileId=file_id)
@@ -36,19 +33,19 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name):
         fh.seek(0)
         
         if 'image' in mime_type:
-            # Comprimimos la imagen a 800px para ahorrar tokens valiosos
             img = Image.open(fh).convert('RGB')
-            img.thumbnail((800, 800)) 
+            img.thumbnail((700, 700)) 
             buffered = BytesIO()
-            img.save(buffered, format="JPEG", quality=80)
+            img.save(buffered, format="JPEG", quality=75)
             encoded = base64.b64encode(buffered.getvalue()).decode('utf-8')
-            return {"tipo": "imagen", "contenido": f"data:image/jpeg;base64,{encoded}"}
+            return {"tipo": "imagen", "contenido": f"data:image/jpeg;base64,{encoded}", "nombre": file_name}
             
         elif mime_type == 'application/pdf':
-            return {"tipo": "texto", "contenido": " ".join([p.extract_text() for p in PdfReader(fh).pages])}
+            texto = " ".join([p.extract_text() for p in PdfReader(fh).pages[:15]])
+            return {"tipo": "texto", "contenido": texto, "nombre": file_name}
         elif 'spreadsheet' in mime_type or 'csv' in mime_type or 'excel' in mime_type:
             df = pd.read_excel(fh) if 'spreadsheet' in mime_type else pd.read_csv(fh)
-            return {"tipo": "texto", "contenido": df.to_string()}
+            return {"tipo": "texto", "contenido": df.head(100).to_string(), "nombre": file_name}
     except Exception: 
         return None
     return None
@@ -71,95 +68,92 @@ if user_input:
     with st.chat_message("assistant"):
         service = get_drive_service()
         
-        # 1. BÚSQUEDA INTELIGENTE
+        # 1. BÚSQUEDA INTELIGENTE AMPLIADA
         palabras_crudas = re.findall(r'[\w-]+', user_input)
         palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos']]
-        if not palabras_clave: 
-            palabras_clave = [max(palabras_crudas, key=len)]
+        if not palabras_clave: palabras_clave = [max(palabras_crudas, key=len)]
             
         pool_archivos = []
         seen_ids = set()
         
-        with st.spinner("Localizando registros en Drive..."):
+        with st.spinner("Rastreando registros en Drive..."):
             for t in palabras_clave:
-                q_folder = f"name contains '{t}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-                folders = service.files().list(q=q_folder).execute().get('files', [])
-                
-                for folder in folders:
-                    q_in_folder = f"'{folder['id']}' in parents and trashed = false"
-                    files_in = service.files().list(q=q_in_folder).execute().get('files', [])
-                    for f in files_in:
-                        if f['id'] not in seen_ids:
-                            pool_archivos.append(f)
-                            seen_ids.add(f['id'])
-                
                 q_files = f"(name contains '{t}' or fullText contains '{t}') and trashed = false"
-                files_out = service.files().list(q=q_files).execute().get('files', [])
+                files_out = service.files().list(q=q_files, fields="files(id, name, mimeType)").execute().get('files', [])
                 for f in files_out:
                     if f['id'] not in seen_ids:
                         pool_archivos.append(f)
                         seen_ids.add(f['id'])
 
-        # SEPARACIÓN Y CORTAFUEGOS
-        pool_fotos = [f for f in pool_archivos if 'image' in f['mimeType']][:25] 
-        pool_documentos = [f for f in pool_archivos if 'image' not in f['mimeType']][:10] 
-        archivos_a_procesar = pool_fotos + pool_documentos
+        # Capacidad ampliada a 35 archivos
+        archivos_totales = pool_archivos[:35]
         
-        if not archivos_a_procesar:
+        if not archivos_totales:
             st.warning("No se encontró información que coincida con la búsqueda.")
             st.stop()
 
-        # 2. DESCARGA Y PREPARACIÓN
-        textos_extraidos = ""
-        imagenes_base64 = []
+        # 2. PROCESAMIENTO POR TANDAS (BATCHES)
+        resumenes_parciales = []
+        tamanio_tanda = 5 # Analizamos de 5 en 5 para no saturar la API
         
-        st.info(f"Procesando {len(archivos_a_procesar)} archivos relevantes...")
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
         
-        bar = st.progress(0)
-        for i, f in enumerate(archivos_a_procesar):
-            res = leer_archivo_multimodal(service, f['id'], f['mimeType'], f['name'])
-            if res:
-                if res["tipo"] == "texto":
-                    textos_extraidos += f"\n--- Archivo: {f['name']} ---\n{res['contenido']}\n"
-                elif res["tipo"] == "imagen":
-                    imagenes_base64.append({"url": res["contenido"], "nombre": f['name']})
-            bar.progress((i + 1) / len(archivos_a_procesar))
+        st.info(f"Se han localizado {len(archivos_totales)} archivos. Iniciando análisis por tandas...")
+        progress_bar = st.progress(0)
+        
+        for n in range(0, len(archivos_totales), tamanio_tanda):
+            tanda = archivos_totales[n:n+tamanio_tanda]
+            contenidos_tanda = []
             
-        if len(textos_extraidos) > 80000:
-            textos_extraidos = textos_extraidos[:80000] + "\n...[CONTENIDO TRUNCADO]"
+            # Descarga de la tanda actual
+            for i, f in enumerate(tanda):
+                res = leer_archivo_multimodal(service, f['id'], f['mimeType'], f['name'])
+                if res: contenidos_tanda.append(res)
+            
+            # Análisis de la tanda actual
+            if contenidos_tanda:
+                with st.spinner(f"Analizando tanda { (n // tamanio_tanda) + 1}..."):
+                    prompt_tanda = f"Extrae de forma directa y técnica todos los eventos, labores, mediciones o cambios de sensores mencionados en estos archivos. Si es una foto, describe lo que se ve técnicamente. Pregunta del usuario: {user_input}"
+                    
+                    mensaje = [{"type": "text", "text": prompt_tanda}]
+                    for item in contenidos_tanda:
+                        if item["tipo"] == "texto":
+                            mensaje[0]["text"] += f"\n\nARCHIVO {item['nombre']}:\n{item['contenido']}"
+                        else:
+                            mensaje.append({"type": "image_url", "image_url": {"url": item["contenido"]}})
+                    
+                    try:
+                        resp_tanda = llm.invoke([HumanMessage(content=mensaje)])
+                        resumenes_parciales.append(resp_tanda.content)
+                    except Exception as e:
+                        resumenes_parciales.append(f"Error en tanda: {str(e)}")
+            
+            # Actualizar barra y esperar un poco para no quemar la cuota
+            progress_bar.progress(min((n + tamanio_tanda) / len(archivos_totales), 1.0))
+            time.sleep(4) 
 
-        # 3. ENVÍO SEGURO A GEMINI
-        with st.spinner("Analizando evidencia..."):
-            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
+        # 3. CONSOLIDACIÓN FINAL
+        with st.spinner("Redactando reporte final consolidado..."):
+            texto_consolidado = "\n\n".join(resumenes_parciales)
             
-            prompt_maestro = f"""
-            INSTRUCCIONES DE RESPUESTA:
-            - Responde de forma DIRECTA, técnica y concisa.
-            - ESTÁ PROHIBIDO usar introducciones como "Como Ingeniero experto", "Entiendo tu pregunta" o presentaciones similares. Ve directamente a la información.
-            - Si la consulta es sobre "labores", "actividades", "tareas" o "qué se hizo" en una fecha específica, interpreta cada archivo encontrado (documento, foto o tabla) de ese día como evidencia de un hecho, acto o evento realizado.
-            - Describe los hallazgos basándote estrictamente en la evidencia de los archivos adjuntos.
+            prompt_final = f"""
+            Genera un reporte técnico final basado en los siguientes hallazgos parciales de terreno.
+            CONSULTA DEL USUARIO: "{user_input}"
             
-            PREGUNTA DEL USUARIO: "{user_input}"
+            HALLAZGOS EXTRAÍDOS:
+            {texto_consolidado}
             
-            TEXTOS ENCONTRADOS:
-            {textos_extraidos}
-            
-            REQUISITOS TÉCNICOS:
-            1. Analiza TODA la información proporcionada (textos y fotos).
-            2. Identifica el pozo u objetivo específico y descarta información de otros pozos.
-            3. Cita obligatoriamente el nombre del archivo de origen para cada hito o dato mencionado.
-            4. Si la información es insuficiente para responder, indícalo de forma breve.
+            REGLAS:
+            1. Reporte DIRECTO, técnico y sin introducciones.
+            2. Agrupa la información por hitos, actividades o pozos.
+            3. Si la consulta pide "labores", describe cronológicamente lo que los archivos demuestran que se hizo.
+            4. Menciona los nombres de los archivos citados en los hallazgos.
+            5. Si hay contradicciones entre un plan y una bitácora, prioriza la bitácora.
             """
             
-            mensaje_contenido = [{"type": "text", "text": prompt_maestro}]
-            for img in imagenes_base64:
-                mensaje_contenido.append({"type": "image_url", "image_url": {"url": img["url"]}})
-                
             try:
-                response = llm.invoke([HumanMessage(content=mensaje_contenido)])
-                respuesta_final = response.content
+                respuesta_final = llm.invoke(prompt_final)
+                st.markdown(respuesta_final.content)
+                st.session_state.messages.append({"role": "assistant", "content": respuesta_final.content})
             except Exception as e:
-                respuesta_final = f"Error en la consulta: {str(e)}"
-                
-        st.markdown(respuesta_final)
-        st.session_state.messages.append({"role": "assistant", "content": respuesta_final})
+                st.error(f"Error en consolidación: {str(e)}")
