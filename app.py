@@ -13,13 +13,13 @@ from pypdf import PdfReader
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Analista Masivo (Gemini)", layout="wide")
-st.title("🚀 Analista de Terreno Masivo (Motor Gemini 1.5)")
+st.title("🚀 Analista de Terreno Masivo (Motor Gemini)")
 
 def get_drive_service():
     creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
     return build('drive', 'v3', credentials=creds)
 
-# --- FUNCIÓN LECTORA INDIVIDUAL ---
+# --- FUNCIÓN LECTORA ---
 def leer_archivo_multimodal(service, file_id, mime_type, file_name):
     try:
         request = service.files().get_media(fileId=file_id)
@@ -31,11 +31,11 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name):
         fh.seek(0)
         
         if 'image' in mime_type:
-            # Ya no comprimimos tanto la foto porque Gemini tiene memoria gigante
+            # Comprimimos la imagen a 800px para ahorrar tokens valiosos
             img = Image.open(fh).convert('RGB')
-            img.thumbnail((1024, 1024)) 
+            img.thumbnail((800, 800)) 
             buffered = BytesIO()
-            img.save(buffered, format="JPEG", quality=90)
+            img.save(buffered, format="JPEG", quality=80)
             encoded = base64.b64encode(buffered.getvalue()).decode('utf-8')
             return {"tipo": "imagen", "contenido": f"data:image/jpeg;base64,{encoded}"}
             
@@ -66,7 +66,7 @@ if user_input:
     with st.chat_message("assistant"):
         service = get_drive_service()
         
-        # 1. BÚSQUEDA INTELIGENTE EN DRIVE
+        # 1. BÚSQUEDA INTELIGENTE
         palabras_crudas = re.findall(r'[\w-]+', user_input)
         palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos']]
         if not palabras_clave: 
@@ -95,54 +95,58 @@ if user_input:
                         pool_archivos.append(f)
                         seen_ids.add(f['id'])
 
-        if not pool_archivos:
+        # SEPARACIÓN Y CORTAFUEGOS DE CUOTA (¡AQUÍ ESTÁ LA MAGIA!)
+        pool_fotos = [f for f in pool_archivos if 'image' in f['mimeType']][:25] # Máximo 25 fotos
+        pool_documentos = [f for f in pool_archivos if 'image' not in f['mimeType']][:10] # Máximo 10 documentos
+        archivos_a_procesar = pool_fotos + pool_documentos
+        
+        if not archivos_a_procesar:
             st.warning("No encontré información en tu Drive relacionada con esta búsqueda.")
             st.stop()
 
-        # 2. DESCARGA Y PREPARACIÓN MASIVA
+        # 2. DESCARGA Y PREPARACIÓN
         textos_extraidos = ""
         imagenes_base64 = []
         
-        st.success(f"¡Se localizaron {len(pool_archivos)} archivos! Procesando todo en un solo bloque...")
+        st.success(f"¡Se localizaron múltiples archivos! Procesando los {len(archivos_a_procesar)} más relevantes para no exceder la cuota...")
         
-        # Leemos TODOS los archivos sin limitarnos a 3 o 4
         bar = st.progress(0)
-        for i, f in enumerate(pool_archivos):
+        for i, f in enumerate(archivos_a_procesar):
             res = leer_archivo_multimodal(service, f['id'], f['mimeType'], f['name'])
             if res:
                 if res["tipo"] == "texto":
                     textos_extraidos += f"\n--- Archivo: {f['name']} ---\n{res['contenido']}\n"
                 elif res["tipo"] == "imagen":
                     imagenes_base64.append({"url": res["contenido"], "nombre": f['name']})
-            bar.progress((i + 1) / len(pool_archivos))
+            bar.progress((i + 1) / len(archivos_a_procesar))
             
-        # 3. ENVÍO MASIVO A GEMINI 1.5 FLASH
-        with st.spinner("🧠 Gemini está analizando todos los textos y fotos simultáneamente..."):
+        # Cortafuegos para el texto (Asegura que el texto no pase de ~20.000 tokens)
+        if len(textos_extraidos) > 80000:
+            textos_extraidos = textos_extraidos[:80000] + "\n...[RESTO DEL TEXTO RECORTADO POR LÍMITE DE CUOTA]"
+
+        # 3. ENVÍO SEGURO A GEMINI
+        with st.spinner("🧠 Gemini está analizando los textos y fotos..."):
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
             
             prompt_maestro = f"""
             Eres un Ingeniero experto en análisis de datos de terreno. 
-            A continuación se te entregan documentos de texto y fotografías extraídas directamente de las carpetas de operaciones.
-            
             PREGUNTA DEL USUARIO: "{user_input}"
             
             TEXTOS ENCONTRADOS:
             {textos_extraidos}
             
             INSTRUCCIONES CRÍTICAS:
-            1. Analiza TODA la información (textos y fotos adjuntas).
-            2. Si el usuario pregunta por un pozo específico (Ej: PBPC-06), ignora cualquier foto o documento que claramente pertenezca a otro pozo (Ej: PBPC-01).
-            3. Responde a la pregunta de manera estructurada, indicando exactamente de qué archivo o foto sacaste el dato.
-            4. Si la información no aparece ni en los textos ni en las fotos correctas, dilo claramente.
+            1. Analiza TODA la información entregada (textos y fotos adjuntas).
+            2. Identifica de qué pozo trata la pregunta y DESCARTA todo lo que mencione a otros pozos.
+            3. Responde la pregunta de manera estructurada y profesional. Menciona SIEMPRE de qué archivo o foto sacaste el dato.
+            4. Si la información no aparece en los documentos entregados, dilo claramente.
             """
             
-            # Construir el paquete masivo
             mensaje_contenido = [{"type": "text", "text": prompt_maestro}]
             for img in imagenes_base64:
                 mensaje_contenido.append({"type": "image_url", "image_url": {"url": img["url"]}})
                 
             try:
-                # Enviamos todo de un solo golpe. 
                 response = llm.invoke([HumanMessage(content=mensaje_contenido)])
                 respuesta_final = response.content
             except Exception as e:
