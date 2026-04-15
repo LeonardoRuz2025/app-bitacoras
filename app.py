@@ -14,8 +14,8 @@ from langchain_core.messages import HumanMessage
 from pypdf import PdfReader
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Auditoría Técnica de Pozos", layout="wide")
-st.title("📋 Gestión de Bitácoras Técnicas")
+st.set_page_config(page_title="Gestión de Bitácoras", layout="wide")
+st.title("📋 Análisis Técnico de Terreno")
 
 def get_drive_service():
     info_claves = json.loads(st.secrets["GOOGLE_JSON_COMPLETO"])
@@ -32,8 +32,7 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name, fecha_mod):
             _, done = downloader.next_chunk()
         fh.seek(0)
         
-        # Formatear fecha para la IA
-        fecha_legible = fecha_mod.split('T')[0] # Extrae YYYY-MM-DD
+        fecha_legible = fecha_mod.split('T')[0]
         
         if 'image' in mime_type:
             img = Image.open(fh).convert('RGB')
@@ -44,11 +43,12 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name, fecha_mod):
             return {"tipo": "imagen", "contenido": f"data:image/jpeg;base64,{encoded}", "nombre": file_name, "fecha": fecha_legible}
             
         elif mime_type == 'application/pdf':
-            texto = " ".join([p.extract_text() for p in PdfReader(fh).pages[:15]])
+            reader = PdfReader(fh)
+            texto = " ".join([p.extract_text() for p in reader.pages[:10]])
             return {"tipo": "texto", "contenido": texto, "nombre": file_name, "fecha": fecha_legible}
         elif 'spreadsheet' in mime_type or 'csv' in mime_type or 'excel' in mime_type:
             df = pd.read_excel(fh) if 'spreadsheet' in mime_type else pd.read_csv(fh)
-            return {"tipo": "texto", "contenido": df.head(100).to_string(), "nombre": file_name, "fecha": fecha_legible}
+            return {"tipo": "texto", "contenido": df.head(50).to_string(), "nombre": file_name, "fecha": fecha_legible}
     except Exception: 
         return None
     return None
@@ -61,7 +61,7 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]): 
         st.markdown(m["content"])
 
-user_input = st.chat_input("Ej: ¿Cuándo fue el último registro del PBO-08?")
+user_input = st.chat_input("Escriba su consulta aquí...")
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -71,17 +71,16 @@ if user_input:
     with st.chat_message("assistant"):
         service = get_drive_service()
         
-        # 1. BÚSQUEDA CRONOLÓGICA (Trae lo más nuevo primero)
+        # 1. BÚSQUEDA
         palabras_crudas = re.findall(r'[\w-]+', user_input)
-        palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos', 'hizo', 'que', 'dia', 'labores', 'cuanto', 'ultima', 'registros']]
+        palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos', 'hizo', 'que', 'dia']]
         if not palabras_clave: palabras_clave = [max(palabras_crudas, key=len)]
             
         pool_archivos = []
         seen_ids = set()
         
-        with st.spinner("Buscando los registros más recientes en Drive..."):
+        with st.spinner("Consultando Drive..."):
             for t in palabras_clave[:2]:
-                # Solicitamos orden descencente por fecha de modificación
                 q_files = f"(name contains '{t}' or fullText contains '{t}') and trashed = false"
                 files_out = service.files().list(q=q_files, fields="files(id, name, mimeType, modifiedTime)", orderBy="modifiedTime desc").execute().get('files', [])
                 for f in files_out:
@@ -92,17 +91,21 @@ if user_input:
         archivos_totales = pool_archivos[:35]
         
         if not archivos_totales:
-            st.warning("No se encontró evidencia del pozo o término buscado.")
+            st.warning("No se encontraron registros.")
             st.stop()
 
         # 2. PROCESAMIENTO POR TANDAS
         resumenes_parciales = []
-        tamanio_tanda = 7 
+        tamanio_tanda = 8 
         
-        # Usamos 1.5-flash por su estabilidad de cuota
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
+        # FIJAMOS EL MODELO ESTABLE PARA EVITAR EL 404 Y EL 429
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash", 
+            google_api_key=st.secrets["GEMINI_API_KEY"],
+            temperature=0
+        )
         
-        st.info(f"Se analizan los {len(archivos_totales)} registros más recientes encontrados.")
+        st.info(f"Analizando {len(archivos_totales)} archivos...")
         progress_bar = st.progress(0)
         
         for n in range(0, len(archivos_totales), tamanio_tanda):
@@ -114,48 +117,51 @@ if user_input:
                 if res: contenidos_tanda.append(res)
             
             if contenidos_tanda:
-                with st.spinner(f"Analizando bloque { (n // tamanio_tanda) + 1}..."):
-                    prompt_tanda = f"""Extrae hitos y fechas. Si hay fotos o documentos, indica qué actividad se registra y la fecha del archivo. 
-                    Contexto: {user_input}"""
+                with st.spinner(f"Mapeando bloque { (n // tamanio_tanda) + 1}..."):
+                    # PROMPT DE EXTRACCIÓN (SIN INTROS)
+                    prompt_tanda = f"""Extrae datos técnicos y labores de estos archivos. 
+                    Si la pregunta es sobre 'qué se hizo', considera cada archivo como una labor realizada ese día.
+                    Pregunta: {user_input}"""
                     
-                    mensaje = [HumanMessage(content=[{"type": "text", "text": prompt_tanda}])]
+                    # Formato correcto de mensaje para evitar errores de API
+                    msg_content = [{"type": "text", "text": prompt_tanda}]
                     for item in contenidos_tanda:
-                        texto_item = f"\n\nARCHIVO: {item['nombre']} (Fecha: {item['fecha']})\nCONTENIDO: {item['contenido'] if item['tipo'] == 'texto' else 'Imagen adjunta'}"
-                        mensaje[0].content[0]["text"] += texto_item
+                        info_txt = f"\n\nARCHIVO: {item['nombre']} (Fecha: {item['fecha']})\nCONTENIDO: {item['contenido'] if item['tipo'] == 'texto' else 'Imagen adjunta'}"
+                        msg_content[0]["text"] += info_txt
                         if item["tipo"] == "imagen":
-                            mensaje[0].content.append({"type": "image_url", "image_url": {"url": item["contenido"]}})
+                            msg_content.append({"type": "image_url", "image_url": {"url": item["contenido"]}})
                     
                     try:
-                        resp_tanda = llm.invoke(mensaje)
+                        resp_tanda = llm.invoke([HumanMessage(content=msg_content)])
                         resumenes_parciales.append(resp_tanda.content)
-                    except Exception as e:
-                        resumenes_parciales.append(f"Error en bloque: {str(e)}")
+                    except Exception:
+                        continue
             
             progress_bar.progress(min((n + tamanio_tanda) / len(archivos_totales), 1.0))
-            time.sleep(3) 
+            time.sleep(2) 
 
-        # 3. CONSOLIDACIÓN FINAL (Corregida)
-        with st.spinner("Determinando la última fecha de registro..."):
+        # 3. CONSOLIDACIÓN FINAL (PROMPT AJUSTADO SEGÚN TU SOLICITUD)
+        with st.spinner("Generando reporte final..."):
             texto_consolidado = "\n\n".join(resumenes_parciales)
             
             prompt_final = f"""
-            Basándote en los hallazgos extraídos, responde la consulta del usuario.
-            PREGUNTA: "{user_input}"
+            Genera un reporte basado exclusivamente en estos hallazgos.
+            CONSULTA: "{user_input}"
             
-            HALLAZGOS CRONOLÓGICOS:
+            HALLAZGOS:
             {texto_consolidado}
             
-            REGLAS:
-            1. Reporte directo, técnico y SIN introducciones.
-            2. Identifica claramente la fecha más reciente encontrada para el pozo consultado.
-            3. Resume qué se hizo en esa última intervención.
-            4. Menciona el nombre del archivo que respalda esa fecha.
+            INSTRUCCIONES:
+            1. Prohibido usar frases como "Como Ingeniero experto" o introducciones de cortesía. Entrega la información directamente.
+            2. Si la consulta es sobre labores o qué se hizo en una fecha, describe cada archivo encontrado como un evento o hito realizado ese día.
+            3. Estructura la respuesta por pozo o actividad técnica.
+            4. Incluye siempre el nombre del archivo de origen.
             """
             
             try:
-                # LLAMADA CORREGIDA: Usamos HumanMessage para evitar el error de consolidación
+                # Usamos la estructura de mensaje que Gemini 1.5 requiere
                 respuesta_final = llm.invoke([HumanMessage(content=prompt_final)])
                 st.markdown(respuesta_final.content)
                 st.session_state.messages.append({"role": "assistant", "content": respuesta_final.content})
             except Exception as e:
-                st.error(f"Error en el paso final: {str(e)}")
+                st.error(f"Error técnico en el paso final: {str(e)}")
