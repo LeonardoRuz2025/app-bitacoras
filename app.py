@@ -13,12 +13,14 @@ from langchain_core.messages import HumanMessage
 from pypdf import PdfReader
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Sistema de Análisis de Bitácoras", layout="wide")
-st.title("📋 Análisis Técnico de Bitácoras y Terreno")
+st.set_page_config(page_title="Reporte Técnico de Terreno", layout="wide")
+st.title("📋 Gestión de Bitácoras Técnicas")
 
 def get_drive_service():
-    # Lectura de credenciales desde Streamlit Secrets
+    # Leemos el JSON completo desde un solo secreto
     info_claves = json.loads(st.secrets["GOOGLE_JSON_COMPLETO"])
+    
+    # Creamos las credenciales
     creds = service_account.Credentials.from_service_account_info(info_claves)
     return build('drive', 'v3', credentials=creds)
     
@@ -34,6 +36,7 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name):
         fh.seek(0)
         
         if 'image' in mime_type:
+            # Comprimimos la imagen a 800px para ahorrar tokens valiosos
             img = Image.open(fh).convert('RGB')
             img.thumbnail((800, 800)) 
             buffered = BytesIO()
@@ -58,7 +61,7 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]): 
         st.markdown(m["content"])
 
-user_input = st.chat_input("Consulte sobre labores, fechas o datos técnicos...")
+user_input = st.chat_input("Consulte sobre pozos, fechas o actividades técnicas...")
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -70,14 +73,14 @@ if user_input:
         
         # 1. BÚSQUEDA INTELIGENTE
         palabras_crudas = re.findall(r'[\w-]+', user_input)
-        palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos', 'que', 'hizo', 'el', 'dia']]
+        palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos']]
         if not palabras_clave: 
             palabras_clave = [max(palabras_crudas, key=len)]
             
         pool_archivos = []
         seen_ids = set()
         
-        with st.spinner("Consultando registros en Drive..."):
+        with st.spinner("Localizando registros en Drive..."):
             for t in palabras_clave:
                 q_folder = f"name contains '{t}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
                 folders = service.files().list(q=q_folder).execute().get('files', [])
@@ -97,19 +100,20 @@ if user_input:
                         pool_archivos.append(f)
                         seen_ids.add(f['id'])
 
+        # SEPARACIÓN Y CORTAFUEGOS
         pool_fotos = [f for f in pool_archivos if 'image' in f['mimeType']][:25] 
         pool_documentos = [f for f in pool_archivos if 'image' not in f['mimeType']][:10] 
         archivos_a_procesar = pool_fotos + pool_documentos
         
         if not archivos_a_procesar:
-            st.warning("No se encontró información que coincida con los términos de búsqueda.")
+            st.warning("No se encontró información que coincida con la búsqueda.")
             st.stop()
 
         # 2. DESCARGA Y PREPARACIÓN
         textos_extraidos = ""
         imagenes_base64 = []
         
-        st.info(f"Analizando {len(archivos_a_procesar)} archivos detectados...")
+        st.info(f"Procesando {len(archivos_a_procesar)} archivos relevantes...")
         
         bar = st.progress(0)
         for i, f in enumerate(archivos_a_procesar):
@@ -122,27 +126,29 @@ if user_input:
             bar.progress((i + 1) / len(archivos_a_procesar))
             
         if len(textos_extraidos) > 80000:
-            textos_extraidos = textos_extraidos[:80000] + "\n...[CONTENIDO TRUNCADO POR EXTENSIÓN]"
+            textos_extraidos = textos_extraidos[:80000] + "\n...[CONTENIDO TRUNCADO]"
 
         # 3. ENVÍO SEGURO A GEMINI
-        with st.spinner("Procesando respuesta..."):
+        with st.spinner("Analizando evidencia..."):
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
             
-            # --- MEJORA DE PROMPT ---
             prompt_maestro = f"""
-            Analiza los documentos y fotografías adjuntos para responder la siguiente consulta técnica.
-            CONSULTA: "{user_input}"
+            INSTRUCCIONES DE RESPUESTA:
+            - Responde de forma DIRECTA, técnica y concisa.
+            - ESTÁ PROHIBIDO usar introducciones como "Como Ingeniero experto", "Entiendo tu pregunta" o presentaciones similares. Ve directamente a la información.
+            - Si la consulta es sobre "labores", "actividades", "tareas" o "qué se hizo" en una fecha específica, interpreta cada archivo encontrado (documento, foto o tabla) de ese día como evidencia de un hecho, acto o evento realizado.
+            - Describe los hallazgos basándote estrictamente en la evidencia de los archivos adjuntos.
             
-            TEXTOS EXTRAÍDOS:
+            PREGUNTA DEL USUARIO: "{user_input}"
+            
+            TEXTOS ENCONTRADOS:
             {textos_extraidos}
             
-            REGLAS DE RESPUESTA:
-            1. Prohibido usar introducciones como "Como ingeniero experto", "Entiendo tu pregunta" o presentaciones similares. Ve DIRECTAMENTE a los datos.
-            2. Si la consulta se refiere a actividades, labores, eventos o "qué se hizo" en una fecha específica: considera cada archivo (foto o documento) que corresponda a esa fecha como una acción o hito realizado. Describe lo que se evidencia en cada archivo como parte de las labores del día.
-            3. Filtra la información para que corresponda únicamente al pozo o área solicitada.
-            4. Menciona obligatoriamente el nombre del archivo de donde extraes cada punto de información.
-            5. Mantén un tono estrictamente profesional, preciso y sobrio.
-            6. Si la información no permite responder la consulta, indícalo de forma breve.
+            REQUISITOS TÉCNICOS:
+            1. Analiza TODA la información proporcionada (textos y fotos).
+            2. Identifica el pozo u objetivo específico y descarta información de otros pozos.
+            3. Cita obligatoriamente el nombre del archivo de origen para cada hito o dato mencionado.
+            4. Si la información es insuficiente para responder, indícalo de forma breve.
             """
             
             mensaje_contenido = [{"type": "text", "text": prompt_maestro}]
@@ -153,7 +159,7 @@ if user_input:
                 response = llm.invoke([HumanMessage(content=mensaje_contenido)])
                 respuesta_final = response.content
             except Exception as e:
-                respuesta_final = f"Error en el procesamiento de la consulta: {str(e)}"
+                respuesta_final = f"Error en la consulta: {str(e)}"
                 
         st.markdown(respuesta_final)
         st.session_state.messages.append({"role": "assistant", "content": respuesta_final})
