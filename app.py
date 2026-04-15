@@ -34,8 +34,16 @@ def procesar_archivo_groq(service, file_id, file_name, mime_type):
 
         # Si es FOTO (Convertir a Base64 para Groq)
         if "image" in mime_type:
-            encoded_string = base64.b64encode(fh.read()).decode('utf-8')
-            formato = mime_type.split('/')[-1] # jpeg o png
+            img = Image.open(fh)
+            # NUEVO: Reducimos el tamaño de la foto para no saturar a Groq
+            img.thumbnail((800, 800)) 
+            buffered = BytesIO()
+            img.save(buffered, format=img.format if img.format else "JPEG")
+            
+            encoded_string = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            formato = mime_type.split('/')[-1]
+            if formato == "jpg": formato = "jpeg" # Groq es estricto con este nombre
+            
             return {"tipo": "imagen", "contenido": f"data:image/{formato};base64,{encoded_string}"}
         
         # Si es PDF
@@ -121,7 +129,8 @@ if pregunta:
                 response = llm.invoke([mensaje_final])
                 respuesta_texto = response.content
             except Exception as e:
-                respuesta_texto = "Ocurrió un error al procesar los archivos. Es posible que el modelo de visión esté saturado."
+                # NUEVO: Ahora imprimirá el error exacto que envía Groq
+                respuesta_texto = f"🚨 Error técnico de Groq: {str(e)}"
 
             st.markdown(respuesta_texto)
             st.session_state.messages.append({"role": "assistant", "content": respuesta_texto})
