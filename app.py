@@ -3,7 +3,7 @@ import re
 import time
 import base64
 from io import BytesIO
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 import pandas as pd
 import streamlit as st
@@ -21,15 +21,14 @@ from langchain_core.messages import HumanMessage
 st.set_page_config(page_title="Gestión de Bitácoras", layout="wide")
 st.title("📋 Análisis Técnico de Terreno")
 
-# Modelo gratuito recomendado actualmente en Gemini API
-# Fallback por si cambia disponibilidad
+# Modelos con fallback
 MODEL_CANDIDATES = [
     "gemini-3.1-flash-lite-preview",
     "gemini-3-flash-preview",
     "gemini-1.5-flash",
 ]
 
-# Limites conservadores para no agotar contexto/costos
+# Límites conservadores
 MAX_ARCHIVOS_EN_POOL = 35
 MAX_TEXT_CHARS_POR_ARCHIVO = 12000
 MAX_TEXT_CHARS_POR_TANDA = 26000
@@ -41,7 +40,9 @@ STOPWORDS = {
     "dame", "fotos", "serie", "estan", "carpeta", "numeros", "documentos",
     "archivos", "hizo", "que", "dia", "cómo", "como", "cual", "cuál",
     "sobre", "para", "desde", "hasta", "quiero", "necesito", "bitacora",
-    "bitácora", "analiza", "analizar", "reporte", "informe"
+    "bitácora", "analiza", "analizar", "reporte", "informe", "cuando",
+    "última", "ultima", "vez", "tiene", "tengan", "registro", "registros",
+    "del", "las", "los"
 }
 
 
@@ -71,18 +72,71 @@ def get_working_llm():
     for model_name in MODEL_CANDIDATES:
         try:
             llm = build_llm(model_name)
-            # prueba corta
-            llm.invoke([HumanMessage(content="Responde solo: OK")])
-            return llm, model_name
+            prueba = llm.invoke([HumanMessage(content="Responde solo: OK")])
+            texto_prueba = normalizar_respuesta_llm(getattr(prueba, "content", ""))
+            if texto_prueba:
+                return llm, model_name
         except Exception as e:
             last_error = e
             continue
-    raise RuntimeError(f"No fue posible inicializar un modelo Gemini. Último error: {last_error}")
+
+    raise RuntimeError(
+        f"No fue posible inicializar un modelo Gemini. Último error: {last_error}"
+    )
 
 
 # =========================================================
 # UTILIDADES
 # =========================================================
+def normalizar_respuesta_llm(content: Any) -> str:
+    """
+    Convierte respuestas del LLM a texto plano, soportando:
+    - str
+    - list[str]
+    - list[dict]
+    - bloques con atributo .text
+    - objetos varios
+    """
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        partes = []
+        for item in content:
+            if item is None:
+                continue
+
+            if isinstance(item, str):
+                if item.strip():
+                    partes.append(item.strip())
+                continue
+
+            if isinstance(item, dict):
+                # caso común: {"type": "...", "text": "..."}
+                if "text" in item and item["text"]:
+                    partes.append(str(item["text"]).strip())
+                else:
+                    partes.append(str(item).strip())
+                continue
+
+            texto = getattr(item, "text", None)
+            if texto:
+                partes.append(str(texto).strip())
+            else:
+                partes.append(str(item).strip())
+
+        return "\n".join(p for p in partes if p).strip()
+
+    texto = getattr(content, "text", None)
+    if texto:
+        return str(texto).strip()
+
+    return str(content).strip()
+
+
 def clean_text(text: str, max_chars: int = MAX_TEXT_CHARS_POR_ARCHIVO) -> str:
     if not text:
         return ""
@@ -91,13 +145,12 @@ def clean_text(text: str, max_chars: int = MAX_TEXT_CHARS_POR_ARCHIVO) -> str:
 
 
 def escape_drive_query_value(value: str) -> str:
-    # Evita romper query si la palabra contiene comillas simples
     return value.replace("'", "\\'")
 
 
 def extract_keywords(user_input: str, max_keywords: int = 3) -> List[str]:
     palabras = re.findall(r"[\w-]+", user_input.lower())
-    palabras = [p for p in palabras if len(p) > 3 and p not in STOPWORDS]
+    palabras = [p for p in palabras if len(p) > 2 and p not in STOPWORDS]
 
     if not palabras:
         palabras_crudas = re.findall(r"[\w-]+", user_input)
@@ -105,17 +158,17 @@ def extract_keywords(user_input: str, max_keywords: int = 3) -> List[str]:
             return [max(palabras_crudas, key=len)]
         return []
 
-    # prioriza unicas y mas largas
     unicas = []
     for p in sorted(set(palabras), key=len, reverse=True):
         unicas.append(p)
+
     return unicas[:max_keywords]
 
 
 def approx_size(item: Dict) -> int:
     contenido = item.get("contenido", "")
     if item.get("tipo") == "imagen":
-        return 1500  # costo ficticio conservador
+        return 1500
     return len(contenido)
 
 
@@ -131,7 +184,6 @@ def chunk_items_dinamicamente(
     for item in items:
         size = approx_size(item)
 
-        # si el archivo individual ya es muy grande, lo dejamos solo
         if size >= max_chars_por_tanda:
             if actual:
                 tandas.append(actual)
@@ -144,7 +196,8 @@ def chunk_items_dinamicamente(
             len(actual) >= max_archivos_por_tanda
             or chars_actuales + size > max_chars_por_tanda
         ):
-            tandas.append(actual)
+            if actual:
+                tandas.append(actual)
             actual = [item]
             chars_actuales = size
         else:
@@ -162,6 +215,7 @@ def safe_invoke(llm, prompt_or_messages, retries: int = 4, base_wait: float = 2.
     Reintento con backoff exponencial simple.
     """
     last_error = None
+
     for intento in range(retries):
         try:
             return llm.invoke(prompt_or_messages)
@@ -169,6 +223,7 @@ def safe_invoke(llm, prompt_or_messages, retries: int = 4, base_wait: float = 2.
             last_error = e
             wait = base_wait * (2 ** intento)
             time.sleep(wait)
+
     raise last_error
 
 
@@ -207,6 +262,7 @@ def buscar_archivos_drive(service, user_input: str) -> List[Dict]:
                 if f["id"] not in seen_ids:
                     pool_archivos.append(f)
                     seen_ids.add(f["id"])
+
         except Exception:
             continue
 
@@ -221,25 +277,36 @@ def descargar_archivo(service, file_id: str) -> BytesIO:
     fh = BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
+
     while not done:
         _, done = downloader.next_chunk()
+
     fh.seek(0)
     return fh
 
 
 def leer_pdf(fh: BytesIO) -> str:
-    reader = PdfReader(fh)
-    textos = []
-    for page in reader.pages[:MAX_PAGINAS_PDF]:
-        try:
-            textos.append(page.extract_text() or "")
-        except Exception:
-            continue
-    return clean_text(" ".join(textos))
+    try:
+        reader = PdfReader(fh)
+        textos = []
+
+        for page in reader.pages[:MAX_PAGINAS_PDF]:
+            try:
+                texto_pagina = page.extract_text() or ""
+                if texto_pagina:
+                    textos.append(texto_pagina)
+            except Exception:
+                continue
+
+        return clean_text(" ".join(textos))
+    except Exception:
+        return ""
 
 
 def leer_excel_o_csv(fh: BytesIO, mime_type: str) -> str:
     try:
+        fh.seek(0)
+
         if "csv" in mime_type:
             try:
                 df = pd.read_csv(fh, nrows=MAX_FILAS_TABLA)
@@ -249,10 +316,10 @@ def leer_excel_o_csv(fh: BytesIO, mime_type: str) -> str:
         else:
             df = pd.read_excel(fh, nrows=MAX_FILAS_TABLA)
 
-        # limpia columnas muy anchas
         df = df.fillna("")
         texto = df.astype(str).head(MAX_FILAS_TABLA).to_string(index=False)
         return clean_text(texto)
+
     except Exception:
         return ""
 
@@ -311,7 +378,6 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name, fecha_mod):
                 "fecha": fecha_legible,
             }
 
-        # texto plano / docs exportados como binario texto no manejado aquí
         return None
 
     except Exception:
@@ -345,6 +411,7 @@ REGLAS:
             f"Nombre: {item['nombre']}\n"
             f"Fecha: {item['fecha']}\n"
         )
+
         if item["tipo"] == "texto":
             bloque += f"Contenido:\n{item['contenido']}\n"
             msg_content[0]["text"] += bloque
@@ -359,7 +426,9 @@ REGLAS:
 
 
 def construir_prompt_final(user_input: str, resumenes_parciales: List[str]) -> str:
-    hallazgos = "\n\n".join(resumenes_parciales)
+    hallazgos = "\n\n".join(
+        normalizar_respuesta_llm(r) for r in resumenes_parciales if r
+    ).strip()
 
     return f"""
 Genera un reporte final basado EXCLUSIVAMENTE en estos hallazgos parciales.
@@ -381,7 +450,7 @@ INSTRUCCIONES:
 
 
 # =========================================================
-# FLUJO PRINCIPAL
+# ESTADO DE CHAT
 # =========================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -390,10 +459,15 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
+
+# =========================================================
+# FLUJO PRINCIPAL
+# =========================================================
 user_input = st.chat_input("Escriba su consulta aquí...")
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
+
     with st.chat_message("user"):
         st.markdown(user_input)
 
@@ -414,11 +488,11 @@ if user_input:
             with st.spinner("Descargando y leyendo archivos..."):
                 for f in archivos_totales:
                     res = leer_archivo_multimodal(
-                        service,
-                        f["id"],
-                        f["mimeType"],
-                        f["name"],
-                        f["modifiedTime"],
+                        service=service,
+                        file_id=f["id"],
+                        mime_type=f["mimeType"],
+                        file_name=f["name"],
+                        fecha_mod=f["modifiedTime"],
                     )
                     if res:
                         contenidos.append(res)
@@ -429,22 +503,41 @@ if user_input:
 
             tandas = chunk_items_dinamicamente(contenidos)
 
+            if not tandas:
+                st.warning("No se pudieron formar tandas válidas para análisis.")
+                st.stop()
+
             st.info(
                 f"Se analizarán {len(contenidos)} archivos útiles en {len(tandas)} tanda(s)."
             )
 
-            progress_bar = st.progress(0)
+            progress_bar = st.progress(0.0)
             resumenes_parciales = []
 
             for i, tanda in enumerate(tandas, start=1):
                 with st.spinner(f"Analizando tanda {i}/{len(tandas)}..."):
                     msg_content = construir_prompt_resumen_tanda(user_input, tanda)
+
                     try:
                         resp_tanda = safe_invoke(
-                            llm, [HumanMessage(content=msg_content)], retries=4
+                            llm,
+                            [HumanMessage(content=msg_content)],
+                            retries=4
                         )
-                        if resp_tanda and getattr(resp_tanda, "content", None):
-                            resumenes_parciales.append(resp_tanda.content)
+
+                        if resp_tanda and getattr(resp_tanda, "content", None) is not None:
+                            texto_tanda = normalizar_respuesta_llm(resp_tanda.content)
+                            if texto_tanda:
+                                resumenes_parciales.append(texto_tanda)
+                            else:
+                                resumenes_parciales.append(
+                                    f"[Tanda {i} procesada, pero sin contenido textual útil]"
+                                )
+                        else:
+                            resumenes_parciales.append(
+                                f"[Tanda {i} sin respuesta útil del modelo]"
+                            )
+
                     except Exception as e:
                         resumenes_parciales.append(
                             f"[Tanda {i} no procesada por error: {str(e)}]"
@@ -458,14 +551,22 @@ if user_input:
 
             with st.spinner("Consolidando reporte final..."):
                 prompt_final = construir_prompt_final(user_input, resumenes_parciales)
+
                 respuesta_final = safe_invoke(
                     llm,
                     [HumanMessage(content=prompt_final)],
                     retries=4
                 )
 
-            contenido_final = respuesta_final.content
+            contenido_final = normalizar_respuesta_llm(
+                getattr(respuesta_final, "content", "")
+            )
+
+            if not contenido_final:
+                contenido_final = "No fue posible generar una respuesta final con contenido útil."
+
             st.markdown(contenido_final)
+
             st.session_state.messages.append(
                 {"role": "assistant", "content": contenido_final}
             )
