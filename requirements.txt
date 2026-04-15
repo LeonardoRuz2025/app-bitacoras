@@ -2,7 +2,7 @@ streamlit
 google-api-python-client
 google-auth
 langchain
-langchain-groq
+langchain-google-genai
 pypdf
 pandas
 openpyxl
