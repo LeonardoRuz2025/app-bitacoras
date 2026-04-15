@@ -109,7 +109,7 @@ if pregunta:
 
             # Inicializamos el modelo de Groq que soporta imágenes
             # PREPARAR EL MENSAJE PARA GROQ VISION
-            llm = ChatGroq(model="llama-3.2-90b-vision-preview", groq_api_key=GROQ_API_KEY)
+            llm = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", groq_api_key=GROQ_API_KEY)
             
             instruccion = f"""Eres un analista de bitácoras de terreno. 
             Responde la pregunta basándote estrictamente en este texto y en las fotos adjuntas.
