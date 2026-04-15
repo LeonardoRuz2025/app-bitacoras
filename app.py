@@ -1,3 +1,4 @@
+import json # Asegúrate de que esta línea esté arriba con los demás imports
 import streamlit as st
 import re
 import pandas as pd
@@ -16,17 +17,13 @@ st.set_page_config(page_title="Analista Masivo", layout="wide")
 st.title("🚀 Analista de Terreno Masivo (Bitacoras)")
 
 def get_drive_service():
-    # 1. Convertimos los secretos a un diccionario real de Python
-    info_claves = dict(st.secrets["gcp_service_account"])
+    # Leemos el JSON completo desde un solo secreto
+    info_claves = json.loads(st.secrets["GOOGLE_JSON_COMPLETO"])
     
-    # 2. LIMPIEZA MAESTRA: Reemplazamos los saltos de línea mal interpretados
-    # Esto arregla el problema de la firma JWT automáticamente
-    info_claves["private_key"] = info_claves["private_key"].replace("\\n", "\n")
-    
-    # 3. Creamos las credenciales con la info limpia
+    # Creamos las credenciales
     creds = service_account.Credentials.from_service_account_info(info_claves)
     return build('drive', 'v3', credentials=creds)
-
+    
 # --- FUNCIÓN LECTORA ---
 def leer_archivo_multimodal(service, file_id, mime_type, file_name):
     try:
