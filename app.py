@@ -118,7 +118,7 @@ if user_input:
             
         # 3. ENVÍO MASIVO A GEMINI 1.5 FLASH
         with st.spinner("🧠 Gemini está analizando todos los textos y fotos simultáneamente..."):
-            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
+            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
             
             prompt_maestro = f"""
             Eres un Ingeniero experto en análisis de datos de terreno. 
