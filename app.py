@@ -33,19 +33,20 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name):
         fh.seek(0)
         
         if 'image' in mime_type:
+            # Comprimimos un poco más para evitar el error de cuota (600px)
             img = Image.open(fh).convert('RGB')
-            img.thumbnail((700, 700)) 
+            img.thumbnail((600, 600)) 
             buffered = BytesIO()
-            img.save(buffered, format="JPEG", quality=75)
+            img.save(buffered, format="JPEG", quality=70)
             encoded = base64.b64encode(buffered.getvalue()).decode('utf-8')
             return {"tipo": "imagen", "contenido": f"data:image/jpeg;base64,{encoded}", "nombre": file_name}
             
         elif mime_type == 'application/pdf':
-            texto = " ".join([p.extract_text() for p in PdfReader(fh).pages[:15]])
+            texto = " ".join([p.extract_text() for p in PdfReader(fh).pages[:10]])
             return {"tipo": "texto", "contenido": texto, "nombre": file_name}
         elif 'spreadsheet' in mime_type or 'csv' in mime_type or 'excel' in mime_type:
             df = pd.read_excel(fh) if 'spreadsheet' in mime_type else pd.read_csv(fh)
-            return {"tipo": "texto", "contenido": df.head(100).to_string(), "nombre": file_name}
+            return {"tipo": "texto", "contenido": df.head(50).to_string(), "nombre": file_name}
     except Exception: 
         return None
     return None
@@ -68,9 +69,9 @@ if user_input:
     with st.chat_message("assistant"):
         service = get_drive_service()
         
-        # 1. BÚSQUEDA INTELIGENTE AMPLIADA
+        # 1. BÚSQUEDA EN DRIVE
         palabras_crudas = re.findall(r'[\w-]+', user_input)
-        palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos']]
+        palabras_clave = [p for p in palabras_crudas if len(p) > 3 and p.lower() not in ['dame', 'fotos', 'serie', 'estan', 'carpeta', 'numeros', 'documentos', 'archivos', 'hizo', 'que', 'dia']]
         if not palabras_clave: palabras_clave = [max(palabras_crudas, key=len)]
             
         pool_archivos = []
@@ -85,7 +86,7 @@ if user_input:
                         pool_archivos.append(f)
                         seen_ids.add(f['id'])
 
-        # Capacidad ampliada a 35 archivos
+        # Capacidad para hasta 35 archivos relevantes
         archivos_totales = pool_archivos[:35]
         
         if not archivos_totales:
@@ -94,31 +95,32 @@ if user_input:
 
         # 2. PROCESAMIENTO POR TANDAS (BATCHES)
         resumenes_parciales = []
-        tamanio_tanda = 5 # Analizamos de 5 en 5 para no saturar la API
+        # Tanda de 10 archivos para optimizar el número de peticiones (limitadas a 20/día en Free Tier)
+        tamanio_tanda = 10 
         
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
+        llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
         
-        st.info(f"Se han localizado {len(archivos_totales)} archivos. Iniciando análisis por tandas...")
+        st.info(f"Analizando {len(archivos_totales)} archivos mediante procesamiento secuencial...")
         progress_bar = st.progress(0)
         
         for n in range(0, len(archivos_totales), tamanio_tanda):
             tanda = archivos_totales[n:n+tamanio_tanda]
             contenidos_tanda = []
             
-            # Descarga de la tanda actual
-            for i, f in enumerate(tanda):
+            for f in tanda:
                 res = leer_archivo_multimodal(service, f['id'], f['mimeType'], f['name'])
                 if res: contenidos_tanda.append(res)
             
-            # Análisis de la tanda actual
             if contenidos_tanda:
-                with st.spinner(f"Analizando tanda { (n // tamanio_tanda) + 1}..."):
-                    prompt_tanda = f"Extrae de forma directa y técnica todos los eventos, labores, mediciones o cambios de sensores mencionados en estos archivos. Si es una foto, describe lo que se ve técnicamente. Pregunta del usuario: {user_input}"
+                with st.spinner(f"Analizando bloque { (n // tamanio_tanda) + 1}..."):
+                    prompt_tanda = f"""Identifica y extrae exclusivamente hechos, actos, labores técnicas y eventos registrados. 
+                    Si es un documento, resume las tareas. Si es una foto, describe la evidencia física.
+                    Pregunta del usuario: {user_input}"""
                     
                     mensaje = [{"type": "text", "text": prompt_tanda}]
                     for item in contenidos_tanda:
                         if item["tipo"] == "texto":
-                            mensaje[0]["text"] += f"\n\nARCHIVO {item['nombre']}:\n{item['contenido']}"
+                            mensaje[0]["text"] += f"\n\nARCHIVO: {item['nombre']}\nCONTENIDO: {item['contenido']}"
                         else:
                             mensaje.append({"type": "image_url", "image_url": {"url": item["contenido"]}})
                     
@@ -126,29 +128,29 @@ if user_input:
                         resp_tanda = llm.invoke([HumanMessage(content=mensaje)])
                         resumenes_parciales.append(resp_tanda.content)
                     except Exception as e:
-                        resumenes_parciales.append(f"Error en tanda: {str(e)}")
+                        resumenes_parciales.append(f"Omitido por límite de capacidad en este bloque.")
             
-            # Actualizar barra y esperar un poco para no quemar la cuota
             progress_bar.progress(min((n + tamanio_tanda) / len(archivos_totales), 1.0))
-            time.sleep(4) 
+            # Pausa para estabilizar la cuota por minuto
+            time.sleep(5) 
 
         # 3. CONSOLIDACIÓN FINAL
-        with st.spinner("Redactando reporte final consolidado..."):
+        with st.spinner("Redactando informe consolidado..."):
             texto_consolidado = "\n\n".join(resumenes_parciales)
             
             prompt_final = f"""
-            Genera un reporte técnico final basado en los siguientes hallazgos parciales de terreno.
-            CONSULTA DEL USUARIO: "{user_input}"
+            Genera un reporte técnico basado estrictamente en la evidencia de los hallazgos extraídos.
+            PREGUNTA: "{user_input}"
             
-            HALLAZGOS EXTRAÍDOS:
+            HALLAZGOS:
             {texto_consolidado}
             
-            REGLAS:
-            1. Reporte DIRECTO, técnico y sin introducciones.
-            2. Agrupa la información por hitos, actividades o pozos.
-            3. Si la consulta pide "labores", describe cronológicamente lo que los archivos demuestran que se hizo.
-            4. Menciona los nombres de los archivos citados en los hallazgos.
-            5. Si hay contradicciones entre un plan y una bitácora, prioriza la bitácora.
+            REGLAS DE ORO:
+            1. No uses introducciones como "Como Ingeniero experto" ni frases de cortesía.
+            2. Si la consulta pide "qué se hizo" o labores de un día, considera cada archivo como un evento o hito ocurrido.
+            3. Organiza la respuesta por actividades o pozos.
+            4. Cita siempre el nombre del archivo fuente para cada dato.
+            5. Si no hay datos suficientes para responder, indícalo brevemente.
             """
             
             try:
@@ -156,4 +158,4 @@ if user_input:
                 st.markdown(respuesta_final.content)
                 st.session_state.messages.append({"role": "assistant", "content": respuesta_final.content})
             except Exception as e:
-                st.error(f"Error en consolidación: {str(e)}")
+                st.error("Se ha excedido el límite de consultas diarias de la API gratuita. Por favor, reintente más tarde.")
