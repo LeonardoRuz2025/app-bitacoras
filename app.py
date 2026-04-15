@@ -11,7 +11,6 @@ from googleapiclient.http import MediaIoBaseDownload
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from pypdf import PdfReader
-from datetime import datetime
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Sistema de Análisis de Bitácoras", layout="wide")
@@ -33,19 +32,24 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name):
         fh.seek(0)
         
         if 'image' in mime_type:
+            # Bajamos a 700px para ahorrar tokens de visión
             img = Image.open(fh).convert('RGB')
-            img.thumbnail((800, 800)) 
+            img.thumbnail((700, 700)) 
             buffered = BytesIO()
-            img.save(buffered, format="JPEG", quality=80)
+            img.save(buffered, format="JPEG", quality=75)
             encoded = base64.b64encode(buffered.getvalue()).decode('utf-8')
             return {"tipo": "imagen", "contenido": f"data:image/jpeg;base64,{encoded}"}
             
         elif mime_type == 'application/pdf':
-            return {"tipo": "texto", "contenido": " ".join([p.extract_text() for p in PdfReader(fh).pages])}
+            # Extraemos texto de forma más compacta
+            reader = PdfReader(fh)
+            texto = ""
+            for page in reader.pages[:10]: # Limitamos a las primeras 10 páginas por doc
+                texto += page.extract_text() + "\n"
+            return {"tipo": "texto", "contenido": texto}
         elif 'spreadsheet' in mime_type or 'csv' in mime_type or 'excel' in mime_type:
-            # Cargamos solo las primeras filas para no saturar si es muy grande
             df = pd.read_excel(fh) if 'spreadsheet' in mime_type else pd.read_csv(fh)
-            return {"tipo": "texto", "contenido": df.head(100).to_string()}
+            return {"tipo": "texto", "contenido": df.head(50).to_string()} # Solo primeras 50 filas
     except Exception: 
         return None
     return None
@@ -68,18 +72,16 @@ if user_input:
     with st.chat_message("assistant"):
         service = get_drive_service()
         
-        # --- 1. DETECCIÓN DE FECHA Y BÚSQUEDA AVANZADA ---
         pool_archivos = []
         seen_ids = set()
         
-        # Intentamos extraer una fecha del texto (formatos comunes)
+        # Extracción de fecha para búsqueda cronológica
         regex_fecha = re.search(r'(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)', user_input.lower())
         
-        with st.spinner("Realizando rastreo exhaustivo en Drive..."):
-            # Si hay fecha, buscamos por metadatos de tiempo (Esto es lo que hace Drive Gemini)
+        with st.spinner("Rastreando registros técnicos..."):
+            # Prioridad 1: Búsqueda por fecha si existe
             if regex_fecha:
-                # Si el usuario pregunta por el 8 de abril de 2026:
-                # Buscamos archivos modificados en esa ventana de tiempo
+                # Ajustamos la ventana de tiempo (8 de abril de 2026)
                 q_time = "modifiedTime > '2026-04-07T00:00:00Z' and modifiedTime < '2026-04-09T23:59:59Z' and trashed = false"
                 files_time = service.files().list(q=q_time, fields="files(id, name, mimeType)").execute().get('files', [])
                 for f in files_time:
@@ -87,33 +89,35 @@ if user_input:
                         pool_archivos.append(f)
                         seen_ids.add(f['id'])
 
-            # Búsqueda por palabras clave técnicas (agregamos términos de terreno)
-            palabras_técnicas = ["PTS", "DGA", "Sensor", "Pozo", "Bitacora", "Reporte", "Visita"]
-            palabras_usuario = re.findall(r'[\w-]+', user_input)
-            palabras_clave = [p for p in palabras_usuario if len(p) > 3] + palabras_técnicas
+            # Prioridad 2: Palabras clave técnicas
+            palabras_tecnicas = ["PTS", "DGA", "Sensor", "Bitacora", "Reporte"]
+            # Extraemos palabras de la pregunta
+            palabras_usuario = [p for p in re.findall(r'[\w-]+', user_input) if len(p) > 3]
+            busqueda = (palabras_usuario + palabras_tecnicas)[:6]
 
-            for t in palabras_clave[:5]: # Limitamos para no saturar la API
-                q_files = f"(name contains '{t}' or fullText contains '{t}') and trashed = false"
+            for t in busqueda:
+                q_files = f"name contains '{t}' and trashed = false"
                 files_out = service.files().list(q=q_files, fields="files(id, name, mimeType)").execute().get('files', [])
                 for f in files_out:
                     if f['id'] not in seen_ids:
                         pool_archivos.append(f)
                         seen_ids.add(f['id'])
 
-        # Priorizar archivos que NO sean "Liderazgo" o "Manuales" si hay muchos
-        pool_archivos = sorted(pool_archivos, key=lambda x: ("LIDERAZGO" in x['name'].upper() or "MANUAL" in x['name'].upper()))
+        # --- FILTRO DE CALIDAD Y CUOTA ---
+        # Penalizamos "LIDERAZGO" y "MANUAL" para que queden al final si hay mucho archivo
+        pool_archivos = sorted(pool_archivos, key=lambda x: ("LIDERAZGO" in x['name'].upper() or "PLAN" in x['name'].upper()))
         
-        archivos_a_procesar = pool_archivos[:20] # Procesamos un poco más de contexto
+        # REDUCIMOS EL LÍMITE A 12 ARCHIVOS PARA NO QUEMAR LA CUOTA
+        archivos_a_procesar = pool_archivos[:12]
         
         if not archivos_a_procesar:
-            st.warning("No se encontraron registros técnicos para los términos o la fecha indicada.")
+            st.warning("No se encontraron registros que coincidan.")
             st.stop()
 
-        # 2. DESCARGA Y PREPARACIÓN
         textos_extraidos = ""
         imagenes_base64 = []
         
-        st.info(f"Analizando {len(archivos_a_procesar)} documentos y registros técnicos encontrados...")
+        st.info(f"Analizando los {len(archivos_a_procesar)} registros más relevantes...")
         
         bar = st.progress(0)
         for i, f in enumerate(archivos_a_procesar):
@@ -125,24 +129,27 @@ if user_input:
                     imagenes_base64.append({"url": res["contenido"], "nombre": f['name']})
             bar.progress((i + 1) / len(archivos_a_procesar))
             
-        # 3. ENVÍO A GEMINI CON PROMPT DE AUDITORÍA
-        with st.spinner("Generando reporte técnico detallado..."):
+        # Cortafuegos estricto de texto
+        if len(textos_extraidos) > 50000:
+            textos_extraidos = textos_extraidos[:50000] + "...[RESUMIDO]"
+
+        with st.spinner("Generando reporte..."):
+            # Cambiamos a 1.5-flash que es más generoso con las cuotas
             llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=st.secrets["GEMINI_API_KEY"])
             
             prompt_maestro = f"""
-            Actúa como un Auditor Técnico de Terreno. Tu objetivo es reconstruir los hechos ocurridos según la consulta.
+            Analiza los documentos y fotos para reconstruir los hechos.
             CONSULTA: "{user_input}"
             
-            DATOS DISPONIBLES:
+            DATOS DE CAMPO:
             {textos_extraidos}
             
-            INSTRUCCIONES DE RESPUESTA (ESTRICTO):
-            1. Prohibido usar introducciones. Entrega un reporte directo.
-            2. PRIORIDAD DE DATOS: Si encuentras reportes de campo, correos de solicitud de ingreso, cambios de sensores (series), visitas de la DGA o permisos PTS, dales prioridad absoluta sobre planes mensuales o documentos de "Liderazgo".
-            3. Si la pregunta es sobre una fecha: identifica horas, nombres de pozos (ej. PBS-05, PBO-10), personas (ej. Samuel Huanchicay) y cambios técnicos.
-            4. Si un documento es un "Plan Mensual" y solo dice lo que "debería" hacerse, aclara que es una programación, no un hecho realizado.
-            5. Organiza la respuesta por hitos o pozos visitados.
-            6. Indica el nombre del archivo de origen para cada hito mencionado.
+            REGLAS:
+            1. Reporte directo sin introducciones.
+            2. Prioriza hitos reales: visitas DGA, toma de datos, cambios de sensores, folios PTS, nombres de personal.
+            3. Si un archivo es solo un "Plan" o "Liderazgo", menciónalo solo si no hay bitácoras reales.
+            4. Organiza por pozo o actividad técnica.
+            5. Indica el archivo de origen para cada dato.
             """
             
             mensaje_contenido = [{"type": "text", "text": prompt_maestro}]
@@ -151,9 +158,7 @@ if user_input:
                 
             try:
                 response = llm.invoke([HumanMessage(content=mensaje_contenido)])
-                respuesta_final = response.content
+                st.markdown(response.content)
+                st.session_state.messages.append({"role": "assistant", "content": response.content})
             except Exception as e:
-                respuesta_final = f"Error en la generación del reporte: {str(e)}"
-                
-        st.markdown(respuesta_final)
-        st.session_state.messages.append({"role": "assistant", "content": respuesta_final})
+                st.error(f"Límite de capacidad alcanzado. Intente con una pregunta más específica o espere 30 segundos. Detalle: {str(e)}")
