@@ -107,21 +107,39 @@ if user_input:
                     res = leer_archivo_multimodal(service, f['id'], f['mimeType'], f['name'])
                     
                     if res and res["tipo"] == "imagen":
-                        prompt = f"Analiza esta imagen de terreno. Pregunta: {user_input}. Si ves números de serie, marcas o datos técnicos, escríbelos. Si no ves nada relevante, responde 'Sin datos técnicos'."
+                       prompt = f"""
+                        Analiza esta fotografía de terreno.
+                        PREGUNTA DEL USUARIO: "{user_input}"
+                        
+                        INSTRUCCIONES DE FILTRADO ESTRICTO (¡CRÍTICO!):
+                        1. Identifica qué pozo está pidiendo el usuario en su pregunta (Ej: PBPC-06).
+                        2. Mira atentamente la foto. Si ves una pizarra, letrero, papel o placa que indique que esta foto pertenece a un pozo DIFERENTE (por ejemplo, si la foto dice PBPC-01, PBPC-05, etc.), DETENTE y responde EXACTAMENTE con la palabra: "DESCARTADA".
+                        3. Solo si la foto es del pozo correcto (o si no tiene letrero, pero muestra equipos), extrae los números de serie o datos técnicos solicitados.
+                        4. Si es del pozo correcto pero no ves números de serie, responde EXACTAMENTE: "Sin datos".
+                        """
                         
                         try:
                             resp = llm.invoke([HumanMessage(content=[
                                 {"type": "text", "text": prompt},
                                 {"type": "image_url", "image_url": {"url": res["contenido"]}}
                             ])])
-                            if "Sin datos técnicos" not in resp.content:
-                                hallazgos.append(f"✅ **{f['name']}**: {resp.content}")
+                            
+                            respuesta_ia = resp.content.strip()
+                            
+                            # El filtro de inteligencia: Solo mostramos lo que sirve
+                            if "DESCARTADA" in respuesta_ia.upper():
+                                pass # Ignoramos la foto en silencio porque es de otro pozo
+                            elif "SIN DATOS" in respuesta_ia.upper():
+                                pass # Ignoramos porque no tiene seriales
+                            else:
+                                hallazgos.append(f"✅ **{f['name']}**: {respuesta_ia}")
+                                
                         except Exception as e:
-                            hallazgos.append(f"❌ **{f['name']}**: Error en servidor.")
+                            hallazgos.append(f"❌ **{f['name']}**: Error al procesar imagen.")
                         
                         # Pausa para resetear tokens de Groq
                         if i < total - 1:
-                            time.sleep(12)
+                            time.sleep(12) 
             
             # 3. RESULTADO
             if hallazgos:
