@@ -66,10 +66,10 @@ def buscar_inteligente(service, query_text):
                 contexto += f"\n--- ORIGEN: {f['name']} ---\n{contenido}\n"
                 archivos_leidos += 1
                 
-    # 3. CORTAFUEGOS DE TOKENS PARA GROQ
-    # 12,000 tokens son aprox. 48,000 caracteres. Cortamos en 35,000 por seguridad.
-    if len(contexto) > 35000:
-        contexto = contexto[:35000] + "\n\n...[TEXTO RECORTADO POR LÍMITE DE MEMORIA DE LA IA]..."
+    # 3. CORTAFUEGOS DE TOKENS ESTRICTO PARA GROQ
+    # El límite estricto de Groq es 12.000 tokens. Cortamos en 15.000 caracteres.
+    if len(contexto) > 15000:
+        contexto = contexto[:15000] + "\n\n...[TEXTO RECORTADO POR LÍMITE DE MEMORIA DE LA IA]..."
         
     return contexto
 
