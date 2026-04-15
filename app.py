@@ -86,7 +86,7 @@ if user_input:
                 
                 for folder in folders:
                     q_in_folder = f"'{folder['id']}' in parents and trashed = false"
-                    files_in = service.files().list(q_in_folder).execute().get('files', [])
+                    files_in = service.files().list(q=q_in_folder).execute().get('files', [])
                     for f in files_in:
                         if f['id'] not in seen_ids:
                             pool_archivos.append(f)
