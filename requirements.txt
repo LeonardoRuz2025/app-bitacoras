@@ -1,9 +1,0 @@
-streamlit
-google-api-python-client
-google-auth
-langchain
-langchain-google-genai
-pypdf
-pandas
-openpyxl
-pillow
