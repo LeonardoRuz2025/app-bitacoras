@@ -12,7 +12,7 @@ api_key = st.secrets.get("GROQ_API_KEY", "CLAVE_NO_ENCONTRADA")
 
 # 3. Inicializar el motor de IA
 try:
-    llm = ChatGroq(model="llama3-8b-8192", groq_api_key=api_key)
+    llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=api_key)
 except Exception as e:
     st.error("Error al conectar con la IA. Revisa tu API Key.")
 
