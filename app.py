@@ -16,7 +16,15 @@ st.set_page_config(page_title="Analista Masivo", layout="wide")
 st.title("🚀 Analista de Terreno Masivo (Bitacoras)")
 
 def get_drive_service():
-    creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+    # 1. Convertimos los secretos a un diccionario real de Python
+    info_claves = dict(st.secrets["gcp_service_account"])
+    
+    # 2. LIMPIEZA MAESTRA: Reemplazamos los saltos de línea mal interpretados
+    # Esto arregla el problema de la firma JWT automáticamente
+    info_claves["private_key"] = info_claves["private_key"].replace("\\n", "\n")
+    
+    # 3. Creamos las credenciales con la info limpia
+    creds = service_account.Credentials.from_service_account_info(info_claves)
     return build('drive', 'v3', credentials=creds)
 
 # --- FUNCIÓN LECTORA ---
