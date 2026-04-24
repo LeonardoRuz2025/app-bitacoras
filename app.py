@@ -29,16 +29,21 @@ MODEL_CANDIDATES = [
     "gemini-1.5-flash",
 ]
 
-ROOT_DRIVE_FOLDER_NAME = "Bitacoras 2025"
+# Puedes dejar una sola raíz o varias raíces conocidas
+ROOT_DRIVE_FOLDER_NAMES = [
+    "Bitacoras 2025",
+]
 
-MAX_ARCHIVOS_EN_POOL = 120
+MAX_ARCHIVOS_EN_POOL = 150
 MAX_TEXT_CHARS_POR_ARCHIVO = 12000
 MAX_TEXT_CHARS_POR_TANDA = 26000
 MAX_ARCHIVOS_POR_TANDA = 6
 MAX_PAGINAS_PDF = 8
 MAX_FILAS_TABLA = 60
-MAX_RECURSION_ITEMS = 300
-TOP_RESULTADOS_POR_QUERY = 25
+MAX_RECURSION_ITEMS = 400
+TOP_RESULTADOS_POR_QUERY = 30
+MAX_SHARED_FOLDER_CANDIDATES = 8
+MAX_WELL_FOLDER_CANDIDATES = 10
 
 STOPWORDS = {
     "dame", "quiero", "necesito", "podrias", "podrías", "puedes",
@@ -52,6 +57,7 @@ STOPWORDS = {
     "realizaron", "realizado", "labores", "actividad", "actividades",
     "abril", "marzo", "febrero", "enero", "mayo", "junio", "julio",
     "agosto", "septiembre", "setiembre", "octubre", "noviembre", "diciembre",
+    "archivo", "acceso", "ver", "leer", "tienes", "puedes", "existe",
 }
 
 MESES = {
@@ -264,6 +270,21 @@ def chunk_items_dinamicamente(
     return tandas
 
 
+def dedupe_files(items: List[Dict]) -> List[Dict]:
+    seen = set()
+    out = []
+    for item in items:
+        file_id = item.get("id")
+        if file_id and file_id not in seen:
+            out.append(item)
+            seen.add(file_id)
+    return out
+
+
+def score_recent(item: Dict) -> str:
+    return item.get("modifiedTime", "")
+
+
 # =========================================================
 # DETECCION DE CONSULTA
 # =========================================================
@@ -336,10 +357,35 @@ def build_code_variants(code: str) -> List[str]:
     })
 
 
-def extract_keywords(user_input: str, max_keywords: int = 4) -> List[str]:
+def extract_keywords(user_input: str, max_keywords: int = 5) -> List[str]:
     words = re.findall(r"[\w-]+", normalize_text(user_input))
     words = [w for w in words if len(w) > 2 and w not in STOPWORDS]
     return sorted(set(words), key=len, reverse=True)[:max_keywords]
+
+
+def extract_quoted_name(user_input: str) -> Optional[str]:
+    m = re.search(r'"([^"]+)"', user_input)
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(r"'([^']+)'", user_input)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
+def extract_google_drive_id_from_text(text: str) -> Optional[str]:
+    patterns = [
+        r"/d/([a-zA-Z0-9_-]{20,})",
+        r"[?&]id=([a-zA-Z0-9_-]{20,})",
+        r"/folders/([a-zA-Z0-9_-]{20,})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
 
 
 def classify_query(user_input: str) -> Dict[str, bool]:
@@ -361,6 +407,14 @@ def classify_query(user_input: str) -> Dict[str, bool]:
         "instalado", "instalados", "instalada", "instaladas",
         "equipos", "sensores", "instrumentos"
     ]
+    access_terms = [
+        "tienes acceso", "puedes ver", "puedes leer", "tienes acceso al archivo",
+        "puedes acceder", "existe el archivo", "encuentra el archivo",
+        "encuentras el archivo", "si tienes acceso", "si puedes ver"
+    ]
+    folder_terms = [
+        "carpeta", "directorio", "folder", "subcarpeta"
+    ]
 
     fecha_iso = parse_date_text(user_input)
 
@@ -371,6 +425,9 @@ def classify_query(user_input: str) -> Dict[str, bool]:
         "instalacion": any(t in text for t in install_terms),
         "fecha_especifica": fecha_iso is not None,
         "consulta_diaria": fecha_iso is not None and any(t in text for t in activity_terms),
+        "access_check": any(t in text for t in access_terms) or extract_quoted_name(user_input) is not None,
+        "folder_or_directory_query": any(t in text for t in folder_terms),
+        "has_drive_url_or_id": extract_google_drive_id_from_text(user_input) is not None,
     }
 
 
@@ -387,7 +444,7 @@ def find_folder_by_name(_service, folder_name: str) -> Optional[Dict]:
         _service.files()
         .list(
             q=q,
-            fields="files(id, name, mimeType, modifiedTime, parents)",
+            fields="files(id, name, mimeType, modifiedTime, parents, webViewLink, driveId)",
             pageSize=10,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
@@ -409,7 +466,7 @@ def list_children(_service, parent_id: str) -> List[Dict]:
             _service.files()
             .list(
                 q=q,
-                fields="nextPageToken, files(id, name, mimeType, modifiedTime, parents)",
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime, parents, webViewLink, driveId)",
                 pageSize=100,
                 pageToken=page_token,
                 supportsAllDrives=True,
@@ -424,6 +481,73 @@ def list_children(_service, parent_id: str) -> List[Dict]:
             break
 
     return results
+
+
+def get_file_metadata(service, file_id: str) -> Optional[Dict]:
+    try:
+        return (
+            service.files()
+            .get(
+                fileId=file_id,
+                fields="id, name, mimeType, modifiedTime, parents, webViewLink, driveId",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except Exception:
+        return None
+
+
+def search_exact_name_global(service, exact_name: str, only_folders: bool = False) -> List[Dict]:
+    mime_filter = f" and mimeType = '{GOOGLE_FOLDER_MIME}'" if only_folders else ""
+    q = (
+        f"name = '{escape_drive_query_value(exact_name)}' "
+        f"and trashed = false"
+        f"{mime_filter}"
+    )
+
+    try:
+        resp = (
+            service.files()
+            .list(
+                q=q,
+                fields="files(id, name, mimeType, modifiedTime, parents, webViewLink, driveId)",
+                pageSize=50,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                orderBy="modifiedTime desc",
+            )
+            .execute()
+        )
+        return resp.get("files", [])
+    except Exception:
+        return []
+
+
+def search_name_contains_global(service, name_fragment: str, only_folders: bool = False) -> List[Dict]:
+    mime_filter = f" and mimeType = '{GOOGLE_FOLDER_MIME}'" if only_folders else ""
+    q = (
+        f"name contains '{escape_drive_query_value(name_fragment)}' "
+        f"and trashed = false"
+        f"{mime_filter}"
+    )
+
+    try:
+        resp = (
+            service.files()
+            .list(
+                q=q,
+                fields="files(id, name, mimeType, modifiedTime, parents, webViewLink, driveId)",
+                pageSize=50,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                orderBy="modifiedTime desc",
+            )
+            .execute()
+        )
+        return resp.get("files", [])
+    except Exception:
+        return []
 
 
 def pick_month_folder(children: List[Dict], month_num: int, year: int) -> Optional[Dict]:
@@ -443,7 +567,6 @@ def pick_month_folder(children: List[Dict], month_num: int, year: int) -> Option
         if normalize_folder_name(item["name"]) in normalized_targets:
             return item
 
-    # fallback: contiene mes y año
     for item in children:
         if item["mimeType"] != GOOGLE_FOLDER_MIME:
             continue
@@ -513,6 +636,98 @@ def recursive_collect_files(service, folder_id: str, max_items: int = MAX_RECURS
     return collected
 
 
+def recursive_collect_folder_and_files(service, folder_id: str, max_items: int = MAX_RECURSION_ITEMS) -> Tuple[List[Dict], List[Dict]]:
+    folders = []
+    files = []
+    queue = [folder_id]
+    seen = set()
+
+    while queue and len(files) < max_items:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+
+        children = list_children(service, current)
+        for child in children:
+            if child["mimeType"] == GOOGLE_FOLDER_MIME:
+                folders.append(child)
+                queue.append(child["id"])
+            else:
+                files.append(child)
+                if len(files) >= max_items:
+                    break
+
+    return folders, files
+
+
+def search_folders_by_well_code_global(service, well_code: str) -> List[Dict]:
+    candidates = []
+    for variant in build_code_variants(well_code):
+        candidates.extend(search_exact_name_global(service, variant, only_folders=True))
+        candidates.extend(search_name_contains_global(service, variant, only_folders=True))
+    candidates = dedupe_files(candidates)
+    candidates.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
+    return candidates[:MAX_WELL_FOLDER_CANDIDATES]
+
+
+# =========================================================
+# BUSQUEDAS
+# =========================================================
+def search_by_url_or_id(service, user_input: str) -> Tuple[List[Dict], Optional[Dict]]:
+    file_id = extract_google_drive_id_from_text(user_input)
+    if not file_id:
+        return [], None
+
+    meta = get_file_metadata(service, file_id)
+    if not meta:
+        return [], None
+
+    if meta["mimeType"] == GOOGLE_FOLDER_MIME:
+        _, files = recursive_collect_folder_and_files(service, meta["id"])
+        return files[:MAX_ARCHIVOS_EN_POOL], meta
+
+    return [meta], meta
+
+
+def search_access_target(service, user_input: str) -> Tuple[List[Dict], Optional[Dict]]:
+    """
+    Busca archivo/carpeta exacta si el usuario pregunta por acceso.
+    Devuelve (archivos_para_analizar, item_encontrado_o_none)
+    """
+    quoted = extract_quoted_name(user_input)
+    if not quoted:
+        return [], None
+
+    # 1) Exacto global
+    exacts = search_exact_name_global(service, quoted, only_folders=False)
+    if exacts:
+        best = exacts[0]
+        if best["mimeType"] == GOOGLE_FOLDER_MIME:
+            _, files = recursive_collect_folder_and_files(service, best["id"])
+            return files[:MAX_ARCHIVOS_EN_POOL], best
+        return [best], best
+
+    # 2) Exacto como carpeta
+    exact_folders = search_exact_name_global(service, quoted, only_folders=True)
+    if exact_folders:
+        best = exact_folders[0]
+        _, files = recursive_collect_folder_and_files(service, best["id"])
+        return files[:MAX_ARCHIVOS_EN_POOL], best
+
+    # 3) Contiene nombre
+    contains_candidates = search_name_contains_global(service, quoted, only_folders=False)
+    contains_candidates = dedupe_files(contains_candidates)
+    if contains_candidates:
+        best = contains_candidates[0]
+        if best["mimeType"] == GOOGLE_FOLDER_MIME:
+            _, files = recursive_collect_folder_and_files(service, best["id"])
+            return files[:MAX_ARCHIVOS_EN_POOL], best
+        return [best], best
+
+    return [], None
+
+
 def search_drive_general(service, user_input: str) -> List[Dict]:
     well_codes = detect_well_codes(user_input)
     keywords = extract_keywords(user_input)
@@ -521,6 +736,10 @@ def search_drive_general(service, user_input: str) -> List[Dict]:
     for code in well_codes:
         terms.extend(build_code_variants(code))
     terms.extend(keywords)
+
+    quoted = extract_quoted_name(user_input)
+    if quoted:
+        terms.insert(0, quoted)
 
     if not terms:
         terms = [user_input.strip()]
@@ -536,7 +755,7 @@ def search_drive_general(service, user_input: str) -> List[Dict]:
     pool = []
     seen_ids = set()
 
-    for term in unique_terms[:8]:
+    for term in unique_terms[:10]:
         q = (
             f"(name contains '{escape_drive_query_value(term)}' or "
             f"fullText contains '{escape_drive_query_value(term)}') and "
@@ -548,7 +767,7 @@ def search_drive_general(service, user_input: str) -> List[Dict]:
                 service.files()
                 .list(
                     q=q,
-                    fields="files(id, name, mimeType, modifiedTime, parents)",
+                    fields="files(id, name, mimeType, modifiedTime, parents, webViewLink, driveId)",
                     orderBy="modifiedTime desc",
                     pageSize=TOP_RESULTADOS_POR_QUERY,
                     supportsAllDrives=True,
@@ -573,6 +792,11 @@ def search_drive_general(service, user_input: str) -> List[Dict]:
                 if normalize_text(variant) in name:
                     score += 10
 
+        if quoted and normalize_text(quoted) == name:
+            score += 50
+        elif quoted and normalize_text(quoted) in name:
+            score += 20
+
         if any(k in user_norm for k in ["serial", "serie", "placa", "etiqueta", "sensor"]):
             if any(x in name for x in ["sensor", "img", "foto", "image"]):
                 score += 3
@@ -594,67 +818,121 @@ def search_drive_by_date_structure(service, user_input: str) -> List[Dict]:
     year = dt.year
     well_codes = detect_well_codes(user_input)
 
-    root = find_folder_by_name(service, ROOT_DRIVE_FOLDER_NAME)
-    if not root:
-        return []
+    for root_name in ROOT_DRIVE_FOLDER_NAMES:
+        root = find_folder_by_name(service, root_name)
+        if not root:
+            continue
 
-    root_children = list_children(service, root["id"])
-    month_folder = pick_month_folder(root_children, month, year)
-    if not month_folder:
-        return []
+        root_children = list_children(service, root["id"])
+        month_folder = pick_month_folder(root_children, month, year)
+        if not month_folder:
+            continue
 
-    month_children = list_children(service, month_folder["id"])
-    day_folder = pick_day_folder(month_children, day)
-    if not day_folder:
-        return []
+        month_children = list_children(service, month_folder["id"])
+        day_folder = pick_day_folder(month_children, day)
+        if not day_folder:
+            continue
 
-    day_children = list_children(service, day_folder["id"])
+        day_children = list_children(service, day_folder["id"])
 
-    archivos = []
-    seen_ids = set()
+        archivos = []
+        seen_ids = set()
 
-    # Archivos sueltos del día
-    for item in day_children:
-        if item["mimeType"] != GOOGLE_FOLDER_MIME and item["id"] not in seen_ids:
-            archivos.append(item)
-            seen_ids.add(item["id"])
-
-    # Si el usuario menciona pozo, priorizar esa subcarpeta
-    matching_well_folders = pick_well_folders(day_children, well_codes)
-
-    if matching_well_folders:
-        for folder in matching_well_folders:
-            encontrados = recursive_collect_files(service, folder["id"])
-            for f in encontrados:
-                if f["id"] not in seen_ids:
-                    archivos.append(f)
-                    seen_ids.add(f["id"])
-    else:
-        # Si no menciona pozo, recorrer todas las subcarpetas del día
         for item in day_children:
-            if item["mimeType"] == GOOGLE_FOLDER_MIME:
-                encontrados = recursive_collect_files(service, item["id"])
+            if item["mimeType"] != GOOGLE_FOLDER_MIME and item["id"] not in seen_ids:
+                archivos.append(item)
+                seen_ids.add(item["id"])
+
+        matching_well_folders = pick_well_folders(day_children, well_codes)
+
+        if matching_well_folders:
+            for folder in matching_well_folders:
+                encontrados = recursive_collect_files(service, folder["id"])
                 for f in encontrados:
                     if f["id"] not in seen_ids:
                         archivos.append(f)
                         seen_ids.add(f["id"])
+        else:
+            for item in day_children:
+                if item["mimeType"] == GOOGLE_FOLDER_MIME:
+                    encontrados = recursive_collect_files(service, item["id"])
+                    for f in encontrados:
+                        if f["id"] not in seen_ids:
+                            archivos.append(f)
+                            seen_ids.add(f["id"])
 
-    # Orden cronológico ascendente dentro del día
-    archivos.sort(key=lambda x: x.get("modifiedTime", ""))
-    return archivos[:MAX_ARCHIVOS_EN_POOL]
+        archivos.sort(key=lambda x: x.get("modifiedTime", ""))
+        if archivos:
+            return archivos[:MAX_ARCHIVOS_EN_POOL]
+
+    return []
 
 
-def buscar_archivos_drive(service, user_input: str) -> List[Dict]:
+def search_drive_by_well_folder_global(service, user_input: str) -> List[Dict]:
+    well_codes = detect_well_codes(user_input)
+    if not well_codes:
+        return []
+
+    pool = []
+    seen = set()
+
+    for code in well_codes:
+        folders = search_folders_by_well_code_global(service, code)
+        for folder in folders:
+            files = recursive_collect_files(service, folder["id"], max_items=MAX_RECURSION_ITEMS)
+            for f in files:
+                if f["id"] not in seen:
+                    pool.append(f)
+                    seen.add(f["id"])
+
+    pool.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
+    return pool[:MAX_ARCHIVOS_EN_POOL]
+
+
+def buscar_archivos_drive(service, user_input: str) -> Tuple[List[Dict], Dict]:
+    """
+    Retorna (archivos, metadata_busqueda)
+    metadata_busqueda sirve para explicar si encontró acceso exacto, por URL, etc.
+    """
     flags = classify_query(user_input)
+    metadata = {
+        "search_mode": "general",
+        "matched_target": None,
+    }
 
-    # Si hay fecha explícita, primero intenta navegación estructural
+    # 1) URL o ID directo
+    if flags["has_drive_url_or_id"]:
+        archivos, matched = search_by_url_or_id(service, user_input)
+        if matched:
+            metadata["search_mode"] = "url_or_id"
+            metadata["matched_target"] = matched
+            return dedupe_files(archivos), metadata
+
+    # 2) Consulta de acceso / existencia por nombre exacto
+    if flags["access_check"]:
+        archivos, matched = search_access_target(service, user_input)
+        if matched:
+            metadata["search_mode"] = "exact_access"
+            metadata["matched_target"] = matched
+            return dedupe_files(archivos), metadata
+
+    # 3) Si hay fecha explícita, intenta navegación estructural
     if flags["fecha_especifica"]:
         por_estructura = search_drive_by_date_structure(service, user_input)
         if por_estructura:
-            return por_estructura
+            metadata["search_mode"] = "date_structure"
+            return dedupe_files(por_estructura), metadata
 
-    # Fallback general
-    return search_drive_general(service, user_input)
+    # 4) Si hay pozo sin fecha, intenta carpetas globales por pozo
+    well_global = search_drive_by_well_folder_global(service, user_input)
+    if well_global:
+        metadata["search_mode"] = "well_global"
+        return dedupe_files(well_global), metadata
+
+    # 5) Fallback general
+    general = search_drive_general(service, user_input)
+    metadata["search_mode"] = "general"
+    return dedupe_files(general), metadata
 
 
 # =========================================================
@@ -830,12 +1108,49 @@ def leer_archivo_multimodal(service, file_id, mime_type, file_name, fecha_mod):
 
 
 # =========================================================
+# RESPUESTAS DIRECTAS DE ACCESO
+# =========================================================
+def construir_respuesta_acceso_directo(matched_target: Dict, archivos_totales: List[Dict]) -> str:
+    tipo = "carpeta" if matched_target.get("mimeType") == GOOGLE_FOLDER_MIME else "archivo"
+    fecha = matched_target.get("modifiedTime", "")
+    fecha_legible = fecha.split("T")[0] if fecha else "sin fecha"
+
+    respuesta = [
+        f"Sí, tengo acceso al {tipo} **{matched_target.get('name', '')}**.",
+        f"Fecha de modificación: **{fecha_legible}**.",
+    ]
+
+    if matched_target.get("webViewLink"):
+        respuesta.append(f"Enlace: {matched_target['webViewLink']}")
+
+    if tipo == "carpeta":
+        respuesta.append(f"Archivos detectados dentro de la carpeta: **{len(archivos_totales)}**.")
+    else:
+        respuesta.append(f"Tipo MIME: **{matched_target.get('mimeType', 'desconocido')}**.")
+
+    return "\n\n".join(respuesta)
+
+
+# =========================================================
 # PROMPTS
 # =========================================================
-def construir_prompt_resumen_tanda(user_input: str, items_tanda: List[Dict]) -> List[Dict]:
+def construir_prompt_resumen_tanda(user_input: str, items_tanda: List[Dict], search_metadata: Dict) -> List[Dict]:
     query_flags = classify_query(user_input)
     fecha_texto = parse_date_text(user_input)
     pozos = detect_well_codes(user_input)
+
+    matched_target = search_metadata.get("matched_target")
+    search_mode = search_metadata.get("search_mode", "general")
+
+    contexto_busqueda = ""
+    if matched_target:
+        contexto_busqueda = f"""
+CONTEXTO DE BÚSQUEDA:
+- Se encontró un objetivo específico accesible en Drive.
+- Nombre objetivo: {matched_target.get('name', '')}
+- Tipo objetivo: {matched_target.get('mimeType', '')}
+- Modo de búsqueda: {search_mode}
+""".strip()
 
     instrucciones_base = f"""
 Analiza los archivos entregados y responde SOLO a partir de la evidencia disponible en documentos e imágenes.
@@ -844,9 +1159,10 @@ CONSULTA DEL USUARIO:
 {user_input}
 
 CONTEXTO:
-- Los archivos provienen de un Drive de bitácoras técnicas de terreno.
+- Los archivos provienen de Google Drive y pueden incluir elementos compartidos por otras cuentas.
 - Las imágenes, PDFs, planillas y documentos son evidencia válida.
 - Debes usar tanto el texto extraído como la inspección visual de las imágenes.
+{contexto_busqueda}
 
 REGLAS OBLIGATORIAS:
 1. No inventes información.
@@ -940,11 +1256,23 @@ FORMATO DE RESPUESTA PARA ESTA TANDA:
     return msg_content
 
 
-def construir_prompt_final(user_input: str, resumenes_parciales: List[str]) -> str:
+def construir_prompt_final(user_input: str, resumenes_parciales: List[str], search_metadata: Dict) -> str:
     query_flags = classify_query(user_input)
     hallazgos = "\n\n".join(
         normalizar_respuesta_llm(r) for r in resumenes_parciales if r
     ).strip()
+
+    matched_target = search_metadata.get("matched_target")
+    search_mode = search_metadata.get("search_mode", "general")
+
+    contexto_extra = ""
+    if matched_target:
+        contexto_extra = f"""
+CONTEXTO DE ACCESO / UBICACIÓN:
+- Objetivo encontrado: {matched_target.get('name', '')}
+- Tipo MIME: {matched_target.get('mimeType', '')}
+- Modo de búsqueda: {search_mode}
+""".strip()
 
     instrucciones = [
         f"""
@@ -955,6 +1283,8 @@ CONSULTA:
 
 HALLAZGOS PARCIALES:
 {hallazgos}
+
+{contexto_extra}
 """.strip(),
         """
 REGLAS GENERALES:
@@ -1000,6 +1330,14 @@ FORMATO RECOMENDADO PARA ÚLTIMO REGISTRO:
 - Observación o limitación
 """.strip())
 
+    if query_flags["access_check"]:
+        instrucciones.append("""
+Si la consulta era sobre acceso o existencia:
+- Indica claramente si el archivo o carpeta fue encontrado.
+- Si fue encontrado, resume qué tipo de contenido contiene.
+- Si no fue encontrado, dilo explícitamente.
+""".strip())
+
     if not any(query_flags.values()):
         instrucciones.append("""
 Si la consulta es abierta, responde de forma técnica y estructurada:
@@ -1030,15 +1368,37 @@ if user_input:
             st.caption(f"Modelo en uso: {model_name}")
 
             with st.spinner("Buscando archivos relevantes en Drive..."):
-                archivos_totales = buscar_archivos_drive(service, user_input)
+                archivos_totales, search_metadata = buscar_archivos_drive(service, user_input)
+
+            matched_target = search_metadata.get("matched_target")
+            query_flags = classify_query(user_input)
+
+            # Si es pregunta de acceso y encontró el objetivo exacto, muestra confirmación inmediata
+            if query_flags["access_check"] and matched_target:
+                st.success("Objetivo encontrado en Drive.")
+                st.markdown(construir_respuesta_acceso_directo(matched_target, archivos_totales))
 
             if not archivos_totales:
-                st.warning("No se encontraron registros relacionados en Drive.")
+                if query_flags["access_check"]:
+                    st.warning("No encontré un archivo o carpeta accesible que coincida con esa referencia.")
+                else:
+                    st.warning("No se encontraron registros relacionados en Drive.")
                 st.stop()
 
             with st.expander("Ver archivos seleccionados", expanded=False):
-                for f in archivos_totales[:40]:
-                    st.write(f"- {f['name']} | {f.get('modifiedTime', '')} | {f.get('mimeType', '')}")
+                if matched_target:
+                    st.write(
+                        f"Objetivo encontrado: {matched_target.get('name', '')} | "
+                        f"{matched_target.get('mimeType', '')} | "
+                        f"{matched_target.get('modifiedTime', '')}"
+                    )
+                    st.write(f"Modo de búsqueda: {search_metadata.get('search_mode', '')}")
+                    st.write("---")
+
+                for f in archivos_totales[:50]:
+                    st.write(
+                        f"- {f['name']} | {f.get('modifiedTime', '')} | {f.get('mimeType', '')}"
+                    )
 
             contenidos = []
             with st.spinner("Descargando y leyendo archivos..."):
@@ -1072,7 +1432,7 @@ if user_input:
 
             for i, tanda in enumerate(tandas, start=1):
                 with st.spinner(f"Analizando tanda {i}/{len(tandas)}..."):
-                    msg_content = construir_prompt_resumen_tanda(user_input, tanda)
+                    msg_content = construir_prompt_resumen_tanda(user_input, tanda, search_metadata)
 
                     try:
                         resp_tanda = safe_invoke(
@@ -1104,7 +1464,7 @@ if user_input:
                 st.stop()
 
             with st.spinner("Consolidando respuesta final..."):
-                prompt_final = construir_prompt_final(user_input, resumenes_parciales)
+                prompt_final = construir_prompt_final(user_input, resumenes_parciales, search_metadata)
 
                 respuesta_final = safe_invoke(
                     llm,
