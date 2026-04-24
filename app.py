@@ -389,6 +389,93 @@ def extract_quoted_name(user_input: str) -> Optional[str]:
 
     return None
 
+def extract_named_target(user_input: str) -> Optional[str]:
+    """
+    Detecta referencias a archivos/carpetas aunque no vengan entre comillas.
+    Ejemplos:
+    - archivo REPORTABILIDAD 2026
+    - planilla REPORTABILIDAD 2026
+    - carpeta Abril 2026
+    """
+    text = user_input.strip()
+
+    patterns = [
+        r'archivo\s+([A-ZÁÉÍÓÚ0-9 _\-\.]+)',
+        r'planilla\s+([A-ZÁÉÍÓÚ0-9 _\-\.]+)',
+        r'carpeta\s+([A-ZÁÉÍÓÚ0-9 _\-\.]+)',
+        r'documento\s+([A-ZÁÉÍÓÚ0-9 _\-\.]+)',
+        r'reporte\s+([A-ZÁÉÍÓÚ0-9 _\-\.]+)',
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip(" .,:;")
+            # corta si empieza otra frase
+            candidate = re.split(
+                r"\b(del|de la|de las|de los|con fecha|del dia|del día|para|que|donde|consultando)\b",
+                candidate,
+                flags=re.IGNORECASE
+            )[0].strip(" .,:;")
+            if len(candidate) >= 3:
+                return candidate
+
+    return None
+
+
+def build_date_variants(fecha_iso: str) -> List[str]:
+    """
+    Genera variantes para matching contra nombres de hojas o carpetas.
+    """
+    if not fecha_iso:
+        return []
+
+    dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
+    dia = dt.day
+    mes = dt.month
+    anio = dt.year
+    mes_nombre = MESES_NUM_A_NOMBRE[mes]
+
+    variants = {
+        fecha_iso,                               # 2026-04-23
+        f"{dia:02d}-{mes:02d}-{anio}",          # 23-04-2026
+        f"{dia}/{mes}/{anio}",                  # 23/4/2026
+        f"{dia:02d}/{mes:02d}/{anio}",          # 23/04/2026
+        f"{dia}-{mes}-{anio}",                  # 23-4-2026
+        f"{dia} de {mes_nombre} de {anio}",     # 23 de abril de 2026
+        f"{dia} {mes_nombre} {anio}",           # 23 abril 2026
+        f"{dia:02d}",                           # 23
+        str(dia),                               # 23
+    }
+
+    return list(variants)
+
+
+def is_supported_analysis_mime(mime_type: str) -> bool:
+    if mime_type == GOOGLE_FOLDER_MIME:
+        return False
+
+    if mime_type == GOOGLE_SHEET_MIME:
+        return True
+
+    if mime_type.startswith(IMAGE_MIME_PREFIX):
+        return True
+
+    if mime_type in {
+        "application/pdf",
+        "application/vnd.google-apps.document",
+        "text/plain",
+        "text/csv",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }:
+        return True
+
+    if "csv" in mime_type or "excel" in mime_type or "spreadsheet" in mime_type:
+        return True
+
+    return False
+
 
 def extract_google_drive_id_from_text(text: str) -> Optional[str]:
     patterns = [
@@ -402,7 +489,6 @@ def extract_google_drive_id_from_text(text: str) -> Optional[str]:
             return m.group(1)
     return None
 
-
 def classify_query(user_input: str) -> Dict[str, bool]:
     text = normalize_text(user_input)
 
@@ -412,7 +498,7 @@ def classify_query(user_input: str) -> Dict[str, bool]:
     ]
     activity_terms = [
         "que se hizo", "que labores", "labores", "actividades", "trabajos",
-        "faenas", "tareas", "hitos", "intervenciones"
+        "faenas", "tareas", "hitos", "intervenciones", "resumen"
     ]
     latest_terms = [
         "ultima vez", "ultimo registro", "ultimo", "mas reciente",
@@ -432,6 +518,8 @@ def classify_query(user_input: str) -> Dict[str, bool]:
     ]
 
     fecha_iso = parse_date_text(user_input)
+    quoted_name = extract_quoted_name(user_input)
+    named_target = extract_named_target(user_input)
 
     return {
         "seriales": any(t in text for t in serial_terms),
@@ -440,10 +528,12 @@ def classify_query(user_input: str) -> Dict[str, bool]:
         "instalacion": any(t in text for t in install_terms),
         "fecha_especifica": fecha_iso is not None,
         "consulta_diaria": fecha_iso is not None and any(t in text for t in activity_terms),
-        "access_check": any(t in text for t in access_terms) or extract_quoted_name(user_input) is not None,
+        "access_check": any(t in text for t in access_terms),
         "has_drive_url_or_id": extract_google_drive_id_from_text(user_input) is not None,
         "fallas_query": any(t in text for t in failure_terms),
+        "has_explicit_target_name": quoted_name is not None or named_target is not None,
     }
+
 
 
 # =========================================================
@@ -704,13 +794,12 @@ def search_by_url_or_id(service, user_input: str) -> Tuple[List[Dict], Optional[
 
     return [meta], meta
 
-
 def search_access_target(service, user_input: str) -> Tuple[List[Dict], Optional[Dict]]:
-    quoted = extract_quoted_name(user_input)
-    if not quoted:
+    target_name = extract_quoted_name(user_input) or extract_named_target(user_input)
+    if not target_name:
         return [], None
 
-    exacts = search_exact_name_global(service, quoted, only_folders=False)
+    exacts = search_exact_name_global(service, target_name, only_folders=False)
     if exacts:
         best = exacts[0]
         if best["mimeType"] == GOOGLE_FOLDER_MIME:
@@ -718,13 +807,13 @@ def search_access_target(service, user_input: str) -> Tuple[List[Dict], Optional
             return files[:MAX_ARCHIVOS_EN_POOL], best
         return [best], best
 
-    exact_folders = search_exact_name_global(service, quoted, only_folders=True)
+    exact_folders = search_exact_name_global(service, target_name, only_folders=True)
     if exact_folders:
         best = exact_folders[0]
         _, files = recursive_collect_folder_and_files(service, best["id"])
         return files[:MAX_ARCHIVOS_EN_POOL], best
 
-    contains_candidates = search_name_contains_global(service, quoted, only_folders=False)
+    contains_candidates = search_name_contains_global(service, target_name, only_folders=False)
     contains_candidates = dedupe_files(contains_candidates)
     if contains_candidates:
         best = contains_candidates[0]
@@ -902,6 +991,7 @@ def buscar_archivos_drive(service, user_input: str) -> Tuple[List[Dict], Dict]:
     metadata = {
         "search_mode": "general",
         "matched_target": None,
+        "target_only": False,
     }
 
     if flags["has_drive_url_or_id"]:
@@ -909,29 +999,37 @@ def buscar_archivos_drive(service, user_input: str) -> Tuple[List[Dict], Dict]:
         if matched:
             metadata["search_mode"] = "url_or_id"
             metadata["matched_target"] = matched
-            return dedupe_files(archivos), metadata
+            metadata["target_only"] = True
+            return dedupe_files([f for f in archivos if is_supported_analysis_mime(f["mimeType"])]), metadata
 
-    if flags["access_check"]:
+    # Si el usuario nombró explícitamente un archivo/carpeta, prioriza eso aunque no esté preguntando por acceso
+    if flags["has_explicit_target_name"] or flags["access_check"]:
         archivos, matched = search_access_target(service, user_input)
         if matched:
-            metadata["search_mode"] = "exact_access"
+            metadata["search_mode"] = "exact_target"
             metadata["matched_target"] = matched
-            return dedupe_files(archivos), metadata
+            metadata["target_only"] = True
+
+            if matched["mimeType"] == GOOGLE_FOLDER_MIME:
+                return dedupe_files([f for f in archivos if is_supported_analysis_mime(f["mimeType"])]), metadata
+
+            # si es archivo individual, analiza solo ese
+            return [matched], metadata
 
     if flags["fecha_especifica"]:
         por_estructura = search_drive_by_date_structure(service, user_input)
         if por_estructura:
             metadata["search_mode"] = "date_structure"
-            return dedupe_files(por_estructura), metadata
+            return dedupe_files([f for f in por_estructura if is_supported_analysis_mime(f["mimeType"])]), metadata
 
     well_global = search_drive_by_well_folder_global(service, user_input)
     if well_global:
         metadata["search_mode"] = "well_global"
-        return dedupe_files(well_global), metadata
+        return dedupe_files([f for f in well_global if is_supported_analysis_mime(f["mimeType"])]), metadata
 
     general = search_drive_general(service, user_input)
     metadata["search_mode"] = "general"
-    return dedupe_files(general), metadata
+    return dedupe_files([f for f in general if is_supported_analysis_mime(f["mimeType"])]), metadata
 
 
 # =========================================================
@@ -1025,8 +1123,13 @@ def rows_to_text_table(rows: List[List[Any]], max_cols: int = MAX_SHEET_COLS) ->
             lineas.append(" | ".join(row))
         return "\n".join(lineas)
         
-
-def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha_mod: str) -> Optional[Dict]:
+def leer_google_sheet_nativo(
+    sheets_service,
+    file_id: str,
+    file_name: str,
+    fecha_mod: str,
+    user_input: Optional[str] = None
+) -> Optional[Dict]:
     try:
         meta = (
             sheets_service.spreadsheets()
@@ -1039,10 +1142,35 @@ def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha
             debug_log(f"El archivo {file_name} no tiene hojas visibles.")
             return None
 
+        fecha_iso = parse_date_text(user_input or "")
+        date_variants_norm = {normalize_folder_name(v) for v in build_date_variants(fecha_iso)} if fecha_iso else set()
+
+        # 1) priorizar hojas que coincidan con la fecha
+        prioritized = []
+        others = []
+
+        for sh in sheets[:MAX_SHEETS_TABS]:
+            props = sh.get("properties", {})
+            title = props.get("title", "")
+            if not title:
+                continue
+
+            title_norm = normalize_folder_name(title)
+
+            if date_variants_norm and title_norm in date_variants_norm:
+                prioritized.append(sh)
+            elif date_variants_norm and any(v in title_norm for v in date_variants_norm if len(v) > 2):
+                prioritized.append(sh)
+            else:
+                others.append(sh)
+
+        # si hay match de fecha, lee primero esas hojas
+        sheets_to_read = prioritized if prioritized else sheets[:MAX_SHEETS_TABS]
+
         bloques = []
         hojas_procesadas = 0
 
-        for sh in sheets[:MAX_SHEETS_TABS]:
+        for sh in sheets_to_read:
             props = sh.get("properties", {})
             title = props.get("title", "")
             if not title:
@@ -1066,7 +1194,7 @@ def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha
                     continue
 
                 tabla = rows_to_text_table(values, max_cols=MAX_SHEET_COLS)
-                tabla = clean_text(tabla, max_chars=6000)
+                tabla = clean_text(tabla, max_chars=7000)
 
                 if tabla.strip():
                     bloques.append(f"HOJA: {title}\n{tabla}")
@@ -1076,6 +1204,42 @@ def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha
                 debug_log(f"Error leyendo hoja '{title}' de '{file_name}': {str(e_hoja)}")
                 continue
 
+        # si no encontró nada en hojas priorizadas, usa fallback con algunas otras
+        if not bloques and prioritized:
+            for sh in others[:5]:
+                props = sh.get("properties", {})
+                title = props.get("title", "")
+                if not title:
+                    continue
+
+                try:
+                    rango = f"'{title}'!A1:AN{MAX_SHEET_ROWS}"
+                    values_resp = (
+                        sheets_service.spreadsheets()
+                        .values()
+                        .get(
+                            spreadsheetId=file_id,
+                            range=rango,
+                            majorDimension="ROWS"
+                        )
+                        .execute()
+                    )
+
+                    values = values_resp.get("values", [])
+                    if not values:
+                        continue
+
+                    tabla = rows_to_text_table(values, max_cols=MAX_SHEET_COLS)
+                    tabla = clean_text(tabla, max_chars=5000)
+
+                    if tabla.strip():
+                        bloques.append(f"HOJA: {title}\n{tabla}")
+                        hojas_procesadas += 1
+
+                except Exception as e_hoja:
+                    debug_log(f"Error fallback leyendo hoja '{title}' de '{file_name}': {str(e_hoja)}")
+                    continue
+
         if not bloques:
             debug_log(f"No se pudo extraer contenido útil de ninguna hoja en {file_name}.")
             return None
@@ -1083,7 +1247,14 @@ def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha
         fecha_legible = fecha_mod.split("T")[0] if fecha_mod else ""
         contenido = "\n\n".join(bloques)
 
-        debug_log(f"Google Sheet leído correctamente: {file_name} | hojas procesadas: {hojas_procesadas}")
+        if prioritized:
+            debug_log(
+                f"Google Sheet leído correctamente: {file_name} | hojas priorizadas por fecha: {len(prioritized)} | hojas procesadas: {hojas_procesadas}"
+            )
+        else:
+            debug_log(
+                f"Google Sheet leído correctamente: {file_name} | hojas procesadas: {hojas_procesadas}"
+            )
 
         return {
             "tipo": "texto",
@@ -1096,6 +1267,7 @@ def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha
     except Exception as e:
         debug_log(f"Error general leyendo Google Sheet '{file_name}': {str(e)}")
         return None
+
 
 
 
@@ -1162,7 +1334,7 @@ def leer_imagen_base64(fh: BytesIO) -> Optional[str]:
     except Exception:
         return None
 
-def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, file_name, fecha_mod):
+def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, file_name, fecha_mod, user_input=None):
     try:
         fecha_legible = fecha_mod.split("T")[0] if fecha_mod else ""
 
@@ -1173,10 +1345,13 @@ def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, f
                 file_id=file_id,
                 file_name=file_name,
                 fecha_mod=fecha_mod,
+                user_input=user_input,
             )
 
         fh = get_file_bytes(drive_service, file_id, mime_type)
         if fh is None:
+            if mime_type == GOOGLE_FOLDER_MIME:
+                return None
             debug_log(f"No se pudieron obtener bytes del archivo: {file_name} | MIME: {mime_type}")
             return None
 
@@ -1565,13 +1740,14 @@ if user_input:
             with st.spinner("Descargando y leyendo archivos..."):
                 for f in archivos_totales:
                     res = leer_archivo_multimodal(
-                        drive_service=drive_service,
-                        sheets_service=sheets_service,
-                        file_id=f["id"],
-                        mime_type=f["mimeType"],
-                        file_name=f["name"],
-                        fecha_mod=f.get("modifiedTime", ""),
-                    )
+                    drive_service=drive_service,
+                    sheets_service=sheets_service,
+                    file_id=f["id"],
+                    mime_type=f["mimeType"],
+                    file_name=f["name"],
+                    fecha_mod=f.get("modifiedTime", ""),
+                    user_input=user_input,
+                )
                     if res:
                         contenidos.append(res)
 
