@@ -51,6 +51,8 @@ MAX_WELL_FOLDER_CANDIDATES = 10
 MAX_SHEETS_TABS = 20
 MAX_SHEET_ROWS = 200
 MAX_SHEET_COLS = 40
+MAX_MATCHED_SHEETS_TO_READ = 5
+MAX_FALLBACK_SHEETS_TO_READ = 5
 
 STOPWORDS = {
     "dame", "quiero", "necesito", "podrias", "podrías", "puedes",
@@ -424,9 +426,6 @@ def extract_named_target(user_input: str) -> Optional[str]:
 
 
 def build_date_variants(fecha_iso: str) -> List[str]:
-    """
-    Genera variantes para matching contra nombres de hojas o carpetas.
-    """
     if not fecha_iso:
         return []
 
@@ -444,6 +443,12 @@ def build_date_variants(fecha_iso: str) -> List[str]:
         f"{dia}-{mes}-{anio}",                  # 23-4-2026
         f"{dia} de {mes_nombre} de {anio}",     # 23 de abril de 2026
         f"{dia} {mes_nombre} {anio}",           # 23 abril 2026
+        f"{dia:02d} {mes:02d} {anio}",          # 23 04 2026
+        f"{dia} {mes} {anio}",                  # 23 4 2026
+        f"{dia:02d}_{mes:02d}_{anio}",          # 23_04_2026
+        f"{dia}_{mes}_{anio}",                  # 23_4_2026
+        f"{dia:02d}.{mes:02d}.{anio}",          # 23.04.2026
+        f"{dia}.{mes}.{anio}",                  # 23.4.2026
         f"{dia:02d}",                           # 23
         str(dia),                               # 23
     }
@@ -1122,7 +1127,89 @@ def rows_to_text_table(rows: List[List[Any]], max_cols: int = MAX_SHEET_COLS) ->
         for row in normalized:
             lineas.append(" | ".join(row))
         return "\n".join(lineas)
-        
+
+def score_sheet_title_against_date(title: str, fecha_iso: Optional[str]) -> int:
+    """
+    Puntúa qué tan bien coincide el nombre de una hoja con la fecha consultada.
+    """
+    if not fecha_iso:
+        return 0
+
+    title_norm = normalize_folder_name(title)
+    variants = build_date_variants(fecha_iso)
+    variants_norm = [normalize_folder_name(v) for v in variants]
+
+    dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
+    dia = str(dt.day)
+    dia_2 = f"{dt.day:02d}"
+    mes = str(dt.month)
+    mes_2 = f"{dt.month:02d}"
+    anio = str(dt.year)
+    mes_nombre = normalize_folder_name(MESES_NUM_A_NOMBRE[dt.month])
+
+    score = 0
+
+    # match exacto
+    if title_norm in variants_norm:
+        score += 100
+
+    # contiene una variante completa
+    for v in variants_norm:
+        if len(v) >= 8 and v in title_norm:
+            score += 60
+            break
+
+    # match por componentes
+    if anio in title_norm:
+        score += 10
+    if mes_nombre in title_norm:
+        score += 15
+    if re.search(rf"\b{mes_2}\b", title_norm) or re.search(rf"\b{mes}\b", title_norm):
+        score += 10
+    if re.search(rf"\b{dia_2}\b", title_norm) or re.search(rf"\b{dia}\b", title_norm):
+        score += 15
+
+    # patrón tipo 23 04 2026 en distintos separadores
+    component_patterns = [
+        rf"\b{dia_2}[-/_. ]{mes_2}[-/_. ]{anio}\b",
+        rf"\b{dia}[-/_. ]{mes}[-/_. ]{anio}\b",
+        rf"\b{anio}[-/_. ]{mes_2}[-/_. ]{dia_2}\b",
+    ]
+    for pat in component_patterns:
+        if re.search(pat, title_norm):
+            score += 80
+            break
+
+    return score
+
+
+def choose_relevant_sheet_titles(all_sheets: List[Dict], fecha_iso: Optional[str]) -> List[str]:
+    """
+    Elige las hojas más relevantes para la fecha pedida recorriendo TODAS las pestañas.
+    """
+    scored = []
+
+    for sh in all_sheets:
+        props = sh.get("properties", {})
+        title = props.get("title", "")
+        if not title:
+            continue
+
+        score = score_sheet_title_against_date(title, fecha_iso)
+        scored.append((score, title))
+
+    # ordena de mejor a peor
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # quédate con las hojas realmente relevantes
+    matched = [title for score, title in scored if score >= 60]
+
+    if matched:
+        return matched[:MAX_MATCHED_SHEETS_TO_READ]
+
+    return []
+
+
 def leer_google_sheet_nativo(
     sheets_service,
     file_id: str,
@@ -1143,39 +1230,29 @@ def leer_google_sheet_nativo(
             return None
 
         fecha_iso = parse_date_text(user_input or "")
-        date_variants_norm = {normalize_folder_name(v) for v in build_date_variants(fecha_iso)} if fecha_iso else set()
+        matched_titles = choose_relevant_sheet_titles(sheets, fecha_iso)
 
-        # 1) priorizar hojas que coincidan con la fecha
-        prioritized = []
-        others = []
+        # Si no hubo match por fecha, fallback limitado
+        if matched_titles:
+            titles_to_read = matched_titles
+            debug_log(
+                f"Google Sheet '{file_name}': hojas elegidas por fecha {fecha_iso}: {titles_to_read}"
+            )
+        else:
+            titles_to_read = []
+            for sh in sheets[:MAX_FALLBACK_SHEETS_TO_READ]:
+                title = sh.get("properties", {}).get("title", "")
+                if title:
+                    titles_to_read.append(title)
 
-        for sh in sheets[:MAX_SHEETS_TABS]:
-            props = sh.get("properties", {})
-            title = props.get("title", "")
-            if not title:
-                continue
-
-            title_norm = normalize_folder_name(title)
-
-            if date_variants_norm and title_norm in date_variants_norm:
-                prioritized.append(sh)
-            elif date_variants_norm and any(v in title_norm for v in date_variants_norm if len(v) > 2):
-                prioritized.append(sh)
-            else:
-                others.append(sh)
-
-        # si hay match de fecha, lee primero esas hojas
-        sheets_to_read = prioritized if prioritized else sheets[:MAX_SHEETS_TABS]
+            debug_log(
+                f"Google Sheet '{file_name}': no hubo match exacto por fecha; fallback a hojas iniciales: {titles_to_read}"
+            )
 
         bloques = []
         hojas_procesadas = 0
 
-        for sh in sheets_to_read:
-            props = sh.get("properties", {})
-            title = props.get("title", "")
-            if not title:
-                continue
-
+        for title in titles_to_read:
             try:
                 rango = f"'{title}'!A1:AN{MAX_SHEET_ROWS}"
                 values_resp = (
@@ -1194,7 +1271,7 @@ def leer_google_sheet_nativo(
                     continue
 
                 tabla = rows_to_text_table(values, max_cols=MAX_SHEET_COLS)
-                tabla = clean_text(tabla, max_chars=7000)
+                tabla = clean_text(tabla, max_chars=9000)
 
                 if tabla.strip():
                     bloques.append(f"HOJA: {title}\n{tabla}")
@@ -1204,42 +1281,6 @@ def leer_google_sheet_nativo(
                 debug_log(f"Error leyendo hoja '{title}' de '{file_name}': {str(e_hoja)}")
                 continue
 
-        # si no encontró nada en hojas priorizadas, usa fallback con algunas otras
-        if not bloques and prioritized:
-            for sh in others[:5]:
-                props = sh.get("properties", {})
-                title = props.get("title", "")
-                if not title:
-                    continue
-
-                try:
-                    rango = f"'{title}'!A1:AN{MAX_SHEET_ROWS}"
-                    values_resp = (
-                        sheets_service.spreadsheets()
-                        .values()
-                        .get(
-                            spreadsheetId=file_id,
-                            range=rango,
-                            majorDimension="ROWS"
-                        )
-                        .execute()
-                    )
-
-                    values = values_resp.get("values", [])
-                    if not values:
-                        continue
-
-                    tabla = rows_to_text_table(values, max_cols=MAX_SHEET_COLS)
-                    tabla = clean_text(tabla, max_chars=5000)
-
-                    if tabla.strip():
-                        bloques.append(f"HOJA: {title}\n{tabla}")
-                        hojas_procesadas += 1
-
-                except Exception as e_hoja:
-                    debug_log(f"Error fallback leyendo hoja '{title}' de '{file_name}': {str(e_hoja)}")
-                    continue
-
         if not bloques:
             debug_log(f"No se pudo extraer contenido útil de ninguna hoja en {file_name}.")
             return None
@@ -1247,14 +1288,9 @@ def leer_google_sheet_nativo(
         fecha_legible = fecha_mod.split("T")[0] if fecha_mod else ""
         contenido = "\n\n".join(bloques)
 
-        if prioritized:
-            debug_log(
-                f"Google Sheet leído correctamente: {file_name} | hojas priorizadas por fecha: {len(prioritized)} | hojas procesadas: {hojas_procesadas}"
-            )
-        else:
-            debug_log(
-                f"Google Sheet leído correctamente: {file_name} | hojas procesadas: {hojas_procesadas}"
-            )
+        debug_log(
+            f"Google Sheet leído correctamente: {file_name} | hojas procesadas: {hojas_procesadas} | hojas seleccionadas: {titles_to_read}"
+        )
 
         return {
             "tipo": "texto",
@@ -1463,6 +1499,8 @@ CONTEXTO DE BÚSQUEDA:
 - Nombre objetivo: {matched_target.get('name', '')}
 - Tipo objetivo: {matched_target.get('mimeType', '')}
 - Modo de búsqueda: {search_mode}
+- Si este objetivo fue encontrado, está PROHIBIDO afirmar que el archivo no existe.
+- Si no encuentras datos para la fecha pedida, debes decir que el archivo existe pero que no se encontró información para esa fecha en las hojas analizadas.
 """.strip()
 
     instrucciones_base = f"""
@@ -1620,6 +1658,7 @@ REGLAS GENERALES:
 6. Si no hay evidencia suficiente, dilo explícitamente.
 7. Prioriza precisión por sobre redacción adornada.
 8. Cuando corresponda, resume por fecha, pozo, actividad o equipo.
+9. Si el archivo objetivo fue encontrado, no afirmes que no existe. Distingue entre "archivo encontrado" y "sin datos para la fecha solicitada".
 """.strip()
     ]
 
