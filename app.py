@@ -123,9 +123,15 @@ def get_google_services():
         info_claves,
         scopes=SCOPES
     )
-    drive_service = build("drive", "v3", credentials=creds)
-    sheets_service = build("sheets", "v4", credentials=creds)
+
+    drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
     return drive_service, sheets_service
+
+def debug_log(msg: str):
+    with st.expander("Depuración", expanded=False):
+        st.write(msg)
 
 
 def build_llm(model_name: str):
@@ -998,7 +1004,19 @@ def rows_to_text_table(rows: List[List[Any]], max_cols: int = MAX_SHEET_COLS) ->
     data = normalized[1:]
 
     try:
-        df = pd.DataFrame(data, columns=header)
+        # evita columnas duplicadas o vacías
+        header_limpio = []
+        usados = {}
+        for i, col in enumerate(header):
+            col = str(col).strip() if str(col).strip() else f"col_{i+1}"
+            if col in usados:
+                usados[col] += 1
+                col = f"{col}_{usados[col]}"
+            else:
+                usados[col] = 1
+            header_limpio.append(col)
+
+        df = pd.DataFrame(data, columns=header_limpio)
         df = df.fillna("")
         return df.astype(str).to_string(index=False)
     except Exception:
@@ -1006,7 +1024,7 @@ def rows_to_text_table(rows: List[List[Any]], max_cols: int = MAX_SHEET_COLS) ->
         for row in normalized:
             lineas.append(" | ".join(row))
         return "\n".join(lineas)
-
+        
 
 def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha_mod: str) -> Optional[Dict]:
     try:
@@ -1016,47 +1034,57 @@ def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha
             .execute()
         )
 
-        sheets = meta.get("sheets", [])[:MAX_SHEETS_TABS]
+        sheets = meta.get("sheets", [])
         if not sheets:
+            debug_log(f"El archivo {file_name} no tiene hojas visibles.")
             return None
 
-        ranges = []
-        titles = []
-        for sh in sheets:
-            title = sh.get("properties", {}).get("title", "")
-            if title:
-                titles.append(title)
-                ranges.append(quote_sheet_title_for_range(title))
-
-        if not ranges:
-            return None
-
-        values_resp = (
-            sheets_service.spreadsheets()
-            .values()
-            .batchGet(
-                spreadsheetId=file_id,
-                ranges=ranges,
-                majorDimension="ROWS"
-            )
-            .execute()
-        )
-
-        value_ranges = values_resp.get("valueRanges", [])
         bloques = []
+        hojas_procesadas = 0
 
-        for idx, vr in enumerate(value_ranges):
-            title = titles[idx] if idx < len(titles) else f"Hoja_{idx+1}"
-            values = vr.get("values", [])
-            tabla = rows_to_text_table(values, max_cols=MAX_SHEET_COLS)
-            if tabla.strip():
-                bloques.append(f"HOJA: {title}\n{clean_text(tabla, max_chars=6000)}")
+        for sh in sheets[:MAX_SHEETS_TABS]:
+            props = sh.get("properties", {})
+            title = props.get("title", "")
+            if not title:
+                continue
+
+            try:
+                rango = f"'{title}'!A1:AN{MAX_SHEET_ROWS}"
+                values_resp = (
+                    sheets_service.spreadsheets()
+                    .values()
+                    .get(
+                        spreadsheetId=file_id,
+                        range=rango,
+                        majorDimension="ROWS"
+                    )
+                    .execute()
+                )
+
+                values = values_resp.get("values", [])
+                if not values:
+                    continue
+
+                tabla = rows_to_text_table(values, max_cols=MAX_SHEET_COLS)
+                tabla = clean_text(tabla, max_chars=6000)
+
+                if tabla.strip():
+                    bloques.append(f"HOJA: {title}\n{tabla}")
+                    hojas_procesadas += 1
+
+            except Exception as e_hoja:
+                debug_log(f"Error leyendo hoja '{title}' de '{file_name}': {str(e_hoja)}")
+                continue
 
         if not bloques:
+            debug_log(f"No se pudo extraer contenido útil de ninguna hoja en {file_name}.")
             return None
 
         fecha_legible = fecha_mod.split("T")[0] if fecha_mod else ""
         contenido = "\n\n".join(bloques)
+
+        debug_log(f"Google Sheet leído correctamente: {file_name} | hojas procesadas: {hojas_procesadas}")
+
         return {
             "tipo": "texto",
             "contenido": clean_text(contenido, max_chars=MAX_TEXT_CHARS_POR_ARCHIVO),
@@ -1065,8 +1093,10 @@ def leer_google_sheet_nativo(sheets_service, file_id: str, file_name: str, fecha
             "mime_type": GOOGLE_SHEET_MIME,
         }
 
-    except Exception:
+    except Exception as e:
+        debug_log(f"Error general leyendo Google Sheet '{file_name}': {str(e)}")
         return None
+
 
 
 # =========================================================
@@ -1132,12 +1162,12 @@ def leer_imagen_base64(fh: BytesIO) -> Optional[str]:
     except Exception:
         return None
 
-
 def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, file_name, fecha_mod):
     try:
         fecha_legible = fecha_mod.split("T")[0] if fecha_mod else ""
 
         if mime_type == GOOGLE_SHEET_MIME:
+            debug_log(f"Intentando leer Google Sheet nativo: {file_name}")
             return leer_google_sheet_nativo(
                 sheets_service=sheets_service,
                 file_id=file_id,
@@ -1147,11 +1177,13 @@ def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, f
 
         fh = get_file_bytes(drive_service, file_id, mime_type)
         if fh is None:
+            debug_log(f"No se pudieron obtener bytes del archivo: {file_name} | MIME: {mime_type}")
             return None
 
         if mime_type.startswith(IMAGE_MIME_PREFIX):
             encoded = leer_imagen_base64(fh)
             if not encoded:
+                debug_log(f"No se pudo procesar la imagen: {file_name}")
                 return None
             return {
                 "tipo": "imagen",
@@ -1164,6 +1196,7 @@ def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, f
         if mime_type == "application/pdf":
             texto = leer_pdf(fh)
             if not texto:
+                debug_log(f"No se pudo extraer texto del PDF: {file_name}")
                 return None
             return {
                 "tipo": "texto",
@@ -1181,6 +1214,7 @@ def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, f
         ):
             texto = leer_excel_o_csv(fh, mime_type)
             if not texto:
+                debug_log(f"No se pudo extraer texto de planilla/CSV: {file_name}")
                 return None
             return {
                 "tipo": "texto",
@@ -1193,6 +1227,7 @@ def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, f
         if mime_type == "application/vnd.google-apps.document":
             texto = leer_texto_plano(fh)
             if not texto:
+                debug_log(f"No se pudo extraer texto del Google Doc: {file_name}")
                 return None
             return {
                 "tipo": "texto",
@@ -1202,9 +1237,11 @@ def leer_archivo_multimodal(drive_service, sheets_service, file_id, mime_type, f
                 "mime_type": mime_type,
             }
 
+        debug_log(f"MIME no soportado o sin lector asignado: {file_name} | {mime_type}")
         return None
 
-    except Exception:
+    except Exception as e:
+        debug_log(f"Error general en leer_archivo_multimodal para {file_name}: {str(e)}")
         return None
 
 
@@ -1539,7 +1576,11 @@ if user_input:
                         contenidos.append(res)
 
             if not contenidos:
-                st.warning("Se encontraron archivos, pero no se pudo extraer contenido útil.")
+                st.error("Se encontraron archivos, pero no se pudo extraer contenido útil.")
+                st.info(
+                    "Revisa el bloque de 'Depuración'. Si aparece un error relacionado con Google Sheets API, "
+                    "normalmente significa que la API de Sheets no está habilitada o que la lectura de hojas falló."
+                )
                 st.stop()
 
             tandas = chunk_items_dinamicamente(contenidos)
